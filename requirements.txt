@@ -1,0 +1,8 @@
+torch
+torchvision
+ultralytics
+Pillow
+tqdm
+requests
+tensorboard
+numpy
