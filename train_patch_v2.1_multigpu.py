@@ -41,7 +41,7 @@ CHECKPOINT_FILE = "patch_checkpoint.pth"
 EVAL_PATIENCE = 10 
 EVAL_CONF_THRESHOLD = 0.25
 
-# --- ✅ FIX: Define collate_fn at the top level so it can be pickled ---
+# --- Define collate_fn at the top level so it can be pickled ---
 def custom_collate_fn(batch):
     """
     Custom collate function to handle batches where some images might not have annotations.
@@ -153,6 +153,7 @@ def train_adversarial_patch(args_dict):
     use_tensorboard = args_dict['use_tensorboard']
     starter_image_path = args_dict['starter_image_path']
     status_queue = args_dict['status_queue']
+    is_parallel = args_dict['is_parallel']
 
     device = torch.device(f"cuda:{gpu_id}")
     if device.type == 'cuda': cudnn.benchmark = True
@@ -162,10 +163,14 @@ def train_adversarial_patch(args_dict):
     training_model = YOLO(MODEL_NAME).to(device)
     training_model.model.train()
 
-    if device.type == 'cuda':
+    # ✅ FIX: Only use torch.compile in single-GPU mode to avoid multiprocessing conflicts.
+    if device.type == 'cuda' and not is_parallel:
         try:
             training_model.model = torch.compile(training_model.model)
-        except Exception: pass
+            print("✅ Model compiled successfully with torch.compile().")
+        except Exception: 
+            print("⚠️ torch.compile() failed. Running without compilation.")
+
 
     if starter_image_path and os.path.exists(starter_image_path):
         starter_image = Image.open(starter_image_path).convert("RGB")
@@ -194,7 +199,7 @@ def train_adversarial_patch(args_dict):
         progress_bar = tqdm(dataloader, desc=f"GPU {gpu_id} | Epoch {epoch}", leave=False, position=gpu_id)
 
         for i, (images, gt_boxes_batch) in enumerate(progress_bar):
-            if images is None: continue # Skip batch if all images failed to load
+            if images is None: continue
             
             images = images.to(device, non_blocking=pin_memory)
             for img_idx in range(images.size(0)):
@@ -334,7 +339,8 @@ if __name__ == '__main__':
                 'gpu_id': i, 'batch_size': batch_sizes[i], 'learning_rate': lr,
                 'log_dir': run_log_dir, 'num_eval_images': args.num_eval_images,
                 'use_tensorboard': (not args.no_tensorboard),
-                'starter_image_path': args.starter_image, 'status_queue': status_queue
+                'starter_image_path': args.starter_image, 'status_queue': status_queue,
+                'is_parallel': True # Pass the flag to disable compile
             }
             p = mp.Process(target=train_adversarial_patch, args=(process_args,))
             processes.append(p)
@@ -381,7 +387,8 @@ if __name__ == '__main__':
                     'gpu_id': 0, 'batch_size': final_batch_size, 'learning_rate': final_learning_rate,
                     'log_dir': session_log_dir, 'num_eval_images': args.num_eval_images,
                     'use_tensorboard': (not args.no_tensorboard), 'resume_path': args.resume,
-                    'starter_image_path': args.starter_image, 'status_queue': dummy_queue
+                    'starter_image_path': args.starter_image, 'status_queue': dummy_queue,
+                    'is_parallel': False # Not parallel
                 }
                 train_adversarial_patch(train_args)
         except Exception as e:
