@@ -165,7 +165,7 @@ def train_adversarial_patch(args_dict):
 
     transform = T.Compose([T.Resize((640, 640)), T.ToTensor()])
     dataset = VisDroneDataset(root_dir=DATASET_PATH, transform=transform)
-    num_workers = os.cpu_count() // (2 * torch.cuda.device_count()) if device.type == 'cuda' else 4
+    num_workers = os.cpu_count() // (2 * torch.cuda.device_count()) if device.type == 'cuda' and torch.cuda.device_count() > 0 else 4
     pin_memory = (device.type == 'cuda')
     def collate_fn(batch):
         images, boxes = [item[0] for item in batch], [item[1] for item in batch]
@@ -176,7 +176,6 @@ def train_adversarial_patch(args_dict):
         epoch += 1
         total_loss = 0
         
-        # Use a simplified description for the parallel view
         progress_bar = tqdm(dataloader, desc=f"GPU {gpu_id} | Epoch {epoch}", leave=False, position=gpu_id)
 
         for i, (images, gt_boxes_batch) in enumerate(progress_bar):
@@ -217,7 +216,6 @@ def train_adversarial_patch(args_dict):
             current_lr = optimizer.param_groups[0]['lr']
             progress_bar.set_postfix(adv_loss=f"{total_loss/(i+1):.4f}", lr=f"{current_lr:.1e}")
             
-            # Send status update to the main process
             status_queue.put({'gpu_id': gpu_id, 'epoch': epoch, 'progress': f"{i+1}/{len(dataloader)}", 'loss': f"{total_loss/(i+1):.4f}", 'best_rate': f"{best_success_rate:.2f}%", 'patience': f"{epochs_no_improve}/{EVAL_PATIENCE}"})
 
         avg_loss = total_loss / len(dataloader)
@@ -249,7 +247,6 @@ def train_adversarial_patch(args_dict):
             break
 
     writer.close()
-    # Return final results for the summary table
     return {'run_dir': log_dir, 'best_success_rate': best_success_rate, 'stopped_at_epoch': epoch}
 
 # --- Crash Notification Function ---
@@ -260,6 +257,14 @@ def send_crash_notification(error_message):
 
 # --- Main execution block ---
 if __name__ == '__main__':
+    # ✅ FIX: Set the multiprocessing start method to 'spawn' to avoid CUDA errors
+    # This must be done right at the beginning of the main execution block.
+    try:
+        mp.set_start_method('spawn', force=True)
+        print("✅ Multiprocessing start method set to 'spawn'.")
+    except RuntimeError:
+        pass # It might have been set already.
+
     def eval_images_type(value):
         if value.lower() == 'all': return -1
         try:
@@ -275,7 +280,6 @@ if __name__ == '__main__':
     parser.add_argument('--starter_image', type=str, default=None, help='Path to an image to use as the starting patch.')
     parser.add_argument('--num_eval_images', type=eval_images_type, default=100, help="Number of images for evaluation, or 'all'.")
     parser.add_argument('--no_tensorboard', action='store_true', help='Disable TensorBoard logging and launch.')
-    # ✅ NEW: Flag to enable parallel multi-GPU training
     parser.add_argument('--parallel', action='store_true', help='Run one training process per available GPU in parallel.')
     args = parser.parse_args()
 
@@ -298,9 +302,10 @@ if __name__ == '__main__':
     if args.parallel and num_gpus > 1:
         batch_sizes = []
         if args.autotune:
-            for i in range(num_gpus):
-                bs = autotune_batch_size(i, MODEL_NAME)
-                batch_sizes.append(bs)
+            # Use a process pool to run autotuning in parallel for each GPU
+            with mp.Pool(processes=num_gpus) as pool:
+                results = pool.starmap(autotune_batch_size, [(i, MODEL_NAME) for i in range(num_gpus)])
+                batch_sizes = results
         else:
             batch_sizes = [args.batch_size] * num_gpus
 
@@ -329,8 +334,12 @@ if __name__ == '__main__':
         while active_processes > 0:
             try:
                 update = status_queue.get(timeout=1)
-                statuses[update['gpu_id']] = update
+                gpu_id = update['gpu_id']
+                statuses[gpu_id] = update
                 
+                if statuses[gpu_id].get('status') == 'stopped':
+                    active_processes -= 1
+
                 # Clear screen and print table
                 os.system('cls' if os.name == 'nt' else 'clear')
                 print(f"--- Live Parallel Training Status ({datetime.now().strftime('%H:%M:%S')}) ---")
@@ -341,11 +350,10 @@ if __name__ == '__main__':
                     status = s.get('status', 'Running')
                     print("{:<6} {:<8} {:<12} {:<12} {:<12} {:<12}".format(
                         i, status.capitalize(), s.get('epoch', '-'), s.get('progress', '-'), s.get('loss', '-'), s.get('best_rate', '-')))
-                    if status != 'Running':
-                        active_processes -= 1
                 time.sleep(1)
             except: # queue.Empty
-                pass
+                if all(not p.is_alive() for p in processes):
+                    break
         
         for p in processes: p.join()
 
@@ -361,7 +369,6 @@ if __name__ == '__main__':
             if not os.path.exists(DATASET_PATH): print(f"Error: Training dataset path not found: '{DATASET_PATH}'")
             elif not os.path.exists(VALIDATION_DATASET_PATH): print(f"Error: Validation dataset path not found: '{VALIDATION_DATASET_PATH}'")
             else:
-                # For single GPU, the queue is not needed
                 dummy_queue = type('Queue', (), {'put': lambda self, x: None})()
                 train_args = {
                     'gpu_id': 0, 'batch_size': final_batch_size, 'learning_rate': final_learning_rate,
