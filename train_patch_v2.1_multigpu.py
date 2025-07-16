@@ -41,6 +41,20 @@ CHECKPOINT_FILE = "patch_checkpoint.pth"
 EVAL_PATIENCE = 10 
 EVAL_CONF_THRESHOLD = 0.25
 
+# --- ✅ FIX: Define collate_fn at the top level so it can be pickled ---
+def custom_collate_fn(batch):
+    """
+    Custom collate function to handle batches where some images might not have annotations.
+    It filters out None items that might result from a failed __getitem__ call.
+    """
+    # Filter out None entries in the batch
+    batch = [b for b in batch if b is not None]
+    if not batch:
+        return None, None # Return None if the whole batch is invalid
+    
+    images, boxes = zip(*batch)
+    return torch.stack(images, 0), boxes
+
 # --- Dataset Classes ---
 class VisDroneDataset(Dataset):
     """Loads images AND their corresponding bounding box annotations."""
@@ -54,7 +68,12 @@ class VisDroneDataset(Dataset):
     def __getitem__(self, idx):
         img_name = self.image_files[idx]
         img_path = os.path.join(self.image_dir, img_name)
-        image = Image.open(img_path).convert("RGB")
+        try:
+            image = Image.open(img_path).convert("RGB")
+        except (IOError, OSError):
+            print(f"Warning: Could not read image {img_path}. Skipping.")
+            return None # Return None if image is corrupted
+
         original_size = image.size
         boxes = []
         annotation_name = os.path.splitext(img_name)[0] + '.txt'
@@ -126,7 +145,6 @@ class DummyWriter:
 # --- Adversarial Patch Training (Now runs as a separate process) ---
 def train_adversarial_patch(args_dict):
     """Main training function, designed to be run in a separate process."""
-    # Unpack arguments
     gpu_id = args_dict['gpu_id']
     batch_size = args_dict['batch_size']
     learning_rate = args_dict['learning_rate']
@@ -167,10 +185,7 @@ def train_adversarial_patch(args_dict):
     dataset = VisDroneDataset(root_dir=DATASET_PATH, transform=transform)
     num_workers = os.cpu_count() // (2 * torch.cuda.device_count()) if device.type == 'cuda' and torch.cuda.device_count() > 0 else 4
     pin_memory = (device.type == 'cuda')
-    def collate_fn(batch):
-        images, boxes = [item[0] for item in batch], [item[1] for item in batch]
-        return torch.stack(images, 0), boxes
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_fn)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory, collate_fn=custom_collate_fn)
 
     while True:
         epoch += 1
@@ -179,6 +194,8 @@ def train_adversarial_patch(args_dict):
         progress_bar = tqdm(dataloader, desc=f"GPU {gpu_id} | Epoch {epoch}", leave=False, position=gpu_id)
 
         for i, (images, gt_boxes_batch) in enumerate(progress_bar):
+            if images is None: continue # Skip batch if all images failed to load
+            
             images = images.to(device, non_blocking=pin_memory)
             for img_idx in range(images.size(0)):
                 gt_boxes = gt_boxes_batch[img_idx]
@@ -257,13 +274,11 @@ def send_crash_notification(error_message):
 
 # --- Main execution block ---
 if __name__ == '__main__':
-    # ✅ FIX: Set the multiprocessing start method to 'spawn' to avoid CUDA errors
-    # This must be done right at the beginning of the main execution block.
     try:
         mp.set_start_method('spawn', force=True)
         print("✅ Multiprocessing start method set to 'spawn'.")
     except RuntimeError:
-        pass # It might have been set already.
+        pass 
 
     def eval_images_type(value):
         if value.lower() == 'all': return -1
@@ -302,22 +317,19 @@ if __name__ == '__main__':
     if args.parallel and num_gpus > 1:
         batch_sizes = []
         if args.autotune:
-            # Use a process pool to run autotuning in parallel for each GPU
             with mp.Pool(processes=num_gpus) as pool:
                 results = pool.starmap(autotune_batch_size, [(i, MODEL_NAME) for i in range(num_gpus)])
                 batch_sizes = results
         else:
             batch_sizes = [args.batch_size] * num_gpus
 
-        processes = []
+        processes, final_results = [], []
         status_queue = mp.Queue()
         
         for i in range(num_gpus):
             run_log_dir = os.path.join(session_log_dir, f"GPU_{i}_Run")
             os.makedirs(run_log_dir, exist_ok=True)
-            
             lr = (batch_sizes[i] / BASE_BATCH_SIZE) * BASE_LR
-
             process_args = {
                 'gpu_id': i, 'batch_size': batch_sizes[i], 'learning_rate': lr,
                 'log_dir': run_log_dir, 'num_eval_images': args.num_eval_images,
@@ -328,7 +340,6 @@ if __name__ == '__main__':
             processes.append(p)
             p.start()
 
-        # Live status monitoring
         statuses = {i: {} for i in range(num_gpus)}
         active_processes = num_gpus
         while active_processes > 0:
@@ -336,11 +347,8 @@ if __name__ == '__main__':
                 update = status_queue.get(timeout=1)
                 gpu_id = update['gpu_id']
                 statuses[gpu_id] = update
-                
                 if statuses[gpu_id].get('status') == 'stopped':
                     active_processes -= 1
-
-                # Clear screen and print table
                 os.system('cls' if os.name == 'nt' else 'clear')
                 print(f"--- Live Parallel Training Status ({datetime.now().strftime('%H:%M:%S')}) ---")
                 print("{:<6} {:<8} {:<12} {:<12} {:<12} {:<12}".format("GPU", "Status", "Epoch", "Progress", "Adv Loss", "Best Rate"))
@@ -351,9 +359,8 @@ if __name__ == '__main__':
                     print("{:<6} {:<8} {:<12} {:<12} {:<12} {:<12}".format(
                         i, status.capitalize(), s.get('epoch', '-'), s.get('progress', '-'), s.get('loss', '-'), s.get('best_rate', '-')))
                 time.sleep(1)
-            except: # queue.Empty
-                if all(not p.is_alive() for p in processes):
-                    break
+            except:
+                if all(not p.is_alive() for p in processes): break
         
         for p in processes: p.join()
 
