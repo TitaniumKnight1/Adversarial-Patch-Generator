@@ -1,7 +1,7 @@
 import os
 from ultralytics import YOLO
 
-def create_visdrone_style_annotations(input_dir, output_dir, model_name='yolov8n.pt'):
+def create_visdrone_style_annotations(input_dir, output_dir, model_name='yolov11n.pt'):
     """
     Performs object detection on images and saves annotations in VisDrone2019 format.
 
@@ -71,7 +71,7 @@ def create_visdrone_style_annotations(input_dir, output_dir, model_name='yolov8n
 if __name__ == '__main__':
     # --- Configuration ---
     # Directory containing your images
-    INPUT_IMAGE_DIRECTORY = '/home/dev/Yolo11Patch/VisDrone2019-DET-val/images'
+    INPUT_IMAGE_DIRECTORY = 'VisDrone2019-DET-val/images'
     
     # Directory where annotation files will be saved
     OUTPUT_ANNOTATION_DIRECTORY = 'annotations_v11'
