@@ -71,7 +71,7 @@ def create_visdrone_style_annotations(input_dir, output_dir, model_name='yolov11
 if __name__ == '__main__':
     # --- Configuration ---
     # Directory containing your images
-    INPUT_IMAGE_DIRECTORY = 'VisDrone2019-DET-val/images'
+    INPUT_IMAGE_DIRECTORY = 'VisDrone2019-DET-train/images'
     
     # Directory where annotation files will be saved
     OUTPUT_ANNOTATION_DIRECTORY = 'annotations_v11'
