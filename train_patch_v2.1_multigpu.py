@@ -19,6 +19,7 @@ from datetime import datetime
 import multiprocessing as mp
 import time
 import json
+from queue import Empty
 
 # Import the evaluation logic from the user-provided file
 from evaluation_logic import run_evaluation
@@ -46,7 +47,6 @@ def setup_process_logging(log_file_path):
     """Redirects stdout and stderr of a child process to a log file."""
     sys.stdout = open(log_file_path, 'a', buffering=1)
     sys.stderr = sys.stdout
-    # The tqdm progress bar instance itself will be directed to the correct output stream.
 
 # --- Define collate_fn at the top level so it can be pickled ---
 def custom_collate_fn(batch):
@@ -327,70 +327,72 @@ if __name__ == '__main__':
     session_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     session_log_dir = os.path.join("runs", session_timestamp)
     os.makedirs(session_log_dir, exist_ok=True)
+    
+    processes = [] # Keep track of spawned processes
 
-    # --- Parallel Execution Logic ---
-    if args.parallel and num_gpus > 1:
-        batch_sizes = []
-        if args.autotune:
-            autotune_args = [{'gpu_id': i, 'log_file': os.path.join(session_log_dir, f"autotune_gpu_{i}.log")} for i in range(num_gpus)]
-            with mp.Pool(processes=num_gpus) as pool:
-                results = pool.map(autotune_batch_size, autotune_args)
-                batch_sizes = results
+    # ✅ FIX: Wrap the entire execution in a try...except KeyboardInterrupt block
+    try:
+        # --- Parallel Execution Logic ---
+        if args.parallel and num_gpus > 1:
+            batch_sizes = []
+            if args.autotune:
+                autotune_args = [{'gpu_id': i, 'log_file': os.path.join(session_log_dir, f"autotune_gpu_{i}.log")} for i in range(num_gpus)]
+                with mp.Pool(processes=num_gpus) as pool:
+                    results = pool.map(autotune_batch_size, autotune_args)
+                    batch_sizes = results
+            else:
+                batch_sizes = [args.batch_size] * num_gpus
+
+            status_queue = mp.Queue()
+            
+            for i in range(num_gpus):
+                run_log_dir = os.path.join(session_log_dir, f"GPU_{i}_Run")
+                os.makedirs(run_log_dir, exist_ok=True)
+                lr = (batch_sizes[i] / BASE_BATCH_SIZE) * BASE_LR
+                process_args = {
+                    'gpu_id': i, 'batch_size': batch_sizes[i], 'learning_rate': lr,
+                    'log_dir': run_log_dir, 'num_eval_images': args.num_eval_images,
+                    'use_tensorboard': (not args.no_tensorboard),
+                    'starter_image_path': args.starter_image, 'status_queue': status_queue,
+                    'is_parallel': True, 'log_file': os.path.join(run_log_dir, 'output.log')
+                }
+                p = mp.Process(target=train_adversarial_patch, args=(process_args,))
+                processes.append(p)
+                p.start()
+
+            statuses = {i: {} for i in range(num_gpus)}
+            active_processes = num_gpus
+            while active_processes > 0:
+                try:
+                    update = status_queue.get(timeout=1)
+                    gpu_id = update['gpu_id']
+                    statuses[gpu_id] = update
+                    if statuses[gpu_id].get('status') in ['stopped', 'finished']:
+                        active_processes -= 1
+                    
+                    os.system('cls' if os.name == 'nt' else 'clear')
+                    print(f"--- Live Parallel Training Status ({datetime.now().strftime('%H:%M:%S')}) ---")
+                    print("{:<6} {:<10} {:<8} {:<12} {:<12} {:<12} {:<10}".format("GPU", "Status", "Epoch", "Progress", "Adv Loss", "Best Rate", "Patience"))
+                    print("-" * 80)
+                    for i in range(num_gpus):
+                        s = statuses.get(i, {})
+                        status = s.get('status', 'Starting')
+                        print("{:<6} {:<10} {:<8} {:<12} {:<12} {:<12} {:<10}".format(
+                            i, status.capitalize(), s.get('epoch', '-'), s.get('progress', '-'), s.get('loss', '-'), s.get('best_rate', '-'), s.get('patience', '-')))
+                    time.sleep(1)
+                except Empty:
+                    if all(not p.is_alive() for p in processes): break
+            
+            for p in processes: p.join()
+
+        # --- Single GPU Execution Logic ---
         else:
-            batch_sizes = [args.batch_size] * num_gpus
+            final_batch_size = args.batch_size
+            if args.autotune and device.type == 'cuda':
+                final_batch_size = autotune_batch_size({'gpu_id': 0, 'log_file': os.path.join(session_log_dir, 'autotune.log')})
 
-        processes, final_results = [], []
-        status_queue = mp.Queue()
-        
-        for i in range(num_gpus):
-            run_log_dir = os.path.join(session_log_dir, f"GPU_{i}_Run")
-            os.makedirs(run_log_dir, exist_ok=True)
-            lr = (batch_sizes[i] / BASE_BATCH_SIZE) * BASE_LR
-            process_args = {
-                'gpu_id': i, 'batch_size': batch_sizes[i], 'learning_rate': lr,
-                'log_dir': run_log_dir, 'num_eval_images': args.num_eval_images,
-                'use_tensorboard': (not args.no_tensorboard),
-                'starter_image_path': args.starter_image, 'status_queue': status_queue,
-                'is_parallel': True, 'log_file': os.path.join(run_log_dir, 'output.log')
-            }
-            p = mp.Process(target=train_adversarial_patch, args=(process_args,))
-            processes.append(p)
-            p.start()
-
-        statuses = {i: {} for i in range(num_gpus)}
-        active_processes = num_gpus
-        while active_processes > 0:
-            try:
-                update = status_queue.get(timeout=1)
-                gpu_id = update['gpu_id']
-                statuses[gpu_id] = update
-                if statuses[gpu_id].get('status') in ['stopped', 'finished']:
-                    active_processes -= 1
-                
-                os.system('cls' if os.name == 'nt' else 'clear')
-                print(f"--- Live Parallel Training Status ({datetime.now().strftime('%H:%M:%S')}) ---")
-                print("{:<6} {:<10} {:<8} {:<12} {:<12} {:<12} {:<10}".format("GPU", "Status", "Epoch", "Progress", "Adv Loss", "Best Rate", "Patience"))
-                print("-" * 80)
-                for i in range(num_gpus):
-                    s = statuses.get(i, {})
-                    status = s.get('status', 'Starting')
-                    print("{:<6} {:<10} {:<8} {:<12} {:<12} {:<12} {:<10}".format(
-                        i, status.capitalize(), s.get('epoch', '-'), s.get('progress', '-'), s.get('loss', '-'), s.get('best_rate', '-'), s.get('patience', '-')))
-                time.sleep(1)
-            except:
-                if all(not p.is_alive() for p in processes): break
-        
-        for p in processes: p.join()
-
-    # --- Single GPU Execution Logic ---
-    else:
-        final_batch_size = args.batch_size
-        if args.autotune and device.type == 'cuda':
-            final_batch_size = autotune_batch_size({'gpu_id': 0, 'log_file': os.path.join(session_log_dir, 'autotune.log')})
-
-        final_learning_rate = (final_batch_size / BASE_BATCH_SIZE) * BASE_LR
-        
-        try:
+            final_learning_rate = (final_batch_size / BASE_BATCH_SIZE) * BASE_LR
+            
             if not os.path.exists(DATASET_PATH): print(f"Error: Training dataset path not found: '{DATASET_PATH}'")
             elif not os.path.exists(VALIDATION_DATASET_PATH): print(f"Error: Validation dataset path not found: '{VALIDATION_DATASET_PATH}'")
             else:
@@ -403,10 +405,19 @@ if __name__ == '__main__':
                     'is_parallel': False, 'log_file': os.path.join(session_log_dir, 'output.log')
                 }
                 train_adversarial_patch(train_args)
-        except Exception as e:
-            print("\n" + "="*60 + f"\n💥 An unexpected error occurred during training! Sending notification...\n" + "="*60)
-            error_info = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-            send_crash_notification(error_info)
-            raise e
+
+    except KeyboardInterrupt:
+        print("\n\n🛑 User interrupted training session. Shutting down all processes...")
+        for p in processes:
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=5)
+        print("All processes terminated. Exiting.")
+        sys.exit(0)
+    except Exception as e:
+        print("\n" + "="*60 + f"\n💥 An unexpected error occurred during training! Sending notification...\n" + "="*60)
+        error_info = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+        send_crash_notification(error_info)
+        raise e
             
     print("\n" + "="*60 + "\n✅ Training session completed.\n" + "="*60)
