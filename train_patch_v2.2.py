@@ -18,6 +18,7 @@ import sys
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from datetime import datetime
 import math
+import signal # Import the signal module for Ctrl+C handling
 
 # --- Configuration (Defaults) ---
 DATASET_PATH = 'VisDrone2019-DET-train'
@@ -67,7 +68,6 @@ class VisDroneDataset(Dataset):
                 with Image.open(img_path) as img:
                     img_rgb = img.convert("RGB")
                     original_size = img_rgb.size
-                    # Apply transformations and store the final tensor
                     if transform:
                         self.images.append(transform(img_rgb))
                     else:
@@ -77,7 +77,6 @@ class VisDroneDataset(Dataset):
                 print(f"Warning: Could not load image {img_path}. Skipping. Error: {e}")
                 continue
 
-            # Load, scale, and store the final annotation tensor
             boxes = []
             annotation_name = os.path.splitext(img_name)[0] + '.txt'
             annotation_path = os.path.join(annotation_dir, annotation_name)
@@ -107,7 +106,6 @@ class VisDroneDataset(Dataset):
         return len(self.images)
 
     def __getitem__(self, idx):
-        # Fetch the pre-processed tensors directly. This is extremely fast.
         return self.images[idx], self.annotations[idx]
 
 class DummyDataset(Dataset):
@@ -226,7 +224,7 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
     transform = T.Compose([T.Resize((640, 640)), T.ToTensor()])
     dataset = VisDroneDataset(root_dir=DATASET_PATH, transform=transform)
     
-    # Restore num_workers as requested. With the pre-processed dataset, this should now be efficient.
+    # Restore num_workers as requested. With the pre-processed dataset and 'spawn' start method, this should be efficient.
     num_workers = min(os.cpu_count() // 2, 16) if os.cpu_count() else 4
     pin_memory = (device.type == 'cuda')
     
@@ -238,7 +236,7 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_fn)
 
-    print(f"\n🚀 {bcolors.BOLD}Starting Adversarial Patch Training{bcolors.ENDC}")
+    print(f"\n� {bcolors.BOLD}Starting Adversarial Patch Training{bcolors.ENDC}")
     print(f"   - Device: {bcolors.OKCYAN}{device.type.upper()}{bcolors.ENDC}")
     print(f"   - Batch Size: {bcolors.OKCYAN}{batch_size}{bcolors.ENDC}")
     print(f"   - Scaled LR: {bcolors.OKCYAN}{learning_rate:.2e}{bcolors.ENDC}")
@@ -349,8 +347,21 @@ def send_crash_notification(error_message):
     except Exception as e:
         print(f"Failed to send crash notification: {e}")
 
+# --- Ctrl+C Handler ---
+def signal_handler(sig, frame):
+    print(f'\n{bcolors.FAIL}{bcolors.BOLD}Ctrl+C detected! Exiting gracefully...{bcolors.ENDC}')
+    sys.exit(0)
+
 # --- Main execution block ---
 if __name__ == '__main__':
+    # FIX: Set the multiprocessing start method to 'spawn'. This creates clean child
+    # processes and is the most robust way to avoid hangs and CUDA initialization issues
+    # when using multiple workers for data loading.
+    torch.multiprocessing.set_start_method('spawn', force=True)
+
+    # FIX: Register the signal handler to catch Ctrl+C (SIGINT)
+    signal.signal(signal.SIGINT, signal_handler)
+
     parser = argparse.ArgumentParser(description="Train adversarial patches against a YOLO model with automatic LR scaling and early stopping.")
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume a specific run.')
     parser.add_argument('--starter_image', type=str, default=None, help='Path to an image to use as the starting point for the patch.')
