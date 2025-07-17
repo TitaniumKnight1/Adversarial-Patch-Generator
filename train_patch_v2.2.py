@@ -91,6 +91,16 @@ class VisDroneDataset(Dataset):
 
         return image, boxes
 
+class DummyDataset(Dataset):
+    """A simple dummy dataset for the autotune memory test that returns tensors of a specific size."""
+    def __init__(self, length=2048, image_size=(3, 640, 640)):
+        self.length = length
+        self.image_size = image_size
+    def __len__(self):
+        return self.length
+    def __getitem__(self, idx):
+        return torch.rand(self.image_size)
+
 # --- Loss Functions ---
 class TotalVariationLoss(torch.nn.Module):
     """Calculates the total variation of an image, encouraging smoothness."""
@@ -107,52 +117,52 @@ class TotalVariationLoss(torch.nn.Module):
 # --- Autotune Function ---
 def autotune_batch_size(device, model, dataset, initial_batch_size=2):
     """
-    Performs a fast memory test by only running the forward pass to find the
-    largest batch size that fits in VRAM, then applies a safety factor.
+    Performs an accurate memory test by simulating a minimal forward and backward pass
+    using dummy data to find the true largest batch size that fits in VRAM.
     """
     batch_size = initial_batch_size
-    print(f"🚀 {bcolors.HEADER}Starting FAST batch size autotune from size {batch_size}...{bcolors.ENDC}")
-    print(f"   {bcolors.WARNING}This test only runs the forward pass for speed.{bcolors.ENDC}")
+    print(f"🚀 {bcolors.HEADER}Starting ACCURATE batch size autotune from size {batch_size}...{bcolors.ENDC}")
+    print(f"   {bcolors.WARNING}This test simulates a full forward/backward pass for accuracy.{bcolors.ENDC}")
     
-    def collate_fn(batch):
-        images = [item[0] for item in batch]
-        # We don't need boxes for this fast test
-        return torch.stack(images, 0), None
-
     while True:
         if batch_size > len(dataset):
              print(f"✅ {bcolors.OKGREEN}Batch size ({batch_size}) exceeds dataset size ({len(dataset)}). Using previous valid size.{bcolors.ENDC}")
              return batch_size // 2
 
         try:
-            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-            # We only need the images for the forward pass test
-            images, _ = next(iter(dataloader))
+            # Use a dummy dataset to avoid disk I/O overhead
+            dummy_data = DummyDataset(length=batch_size)
+            dataloader = DataLoader(dummy_data, batch_size=batch_size)
+            images = next(iter(dataloader))
             images = images.to(device)
             
-            # --- Perform a forward pass ONLY to test memory for activations ---
-            # This is much faster than a full forward-backward cycle.
+            # Minimal optimizer for the test
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+            # --- Perform a minimal forward and backward pass to test VRAM for activations AND gradients ---
+            optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device.type):
-                _ = model.model(images)
+                # We only need the model output to compute a dummy loss
+                output = model.model(images)
+                # The simplest possible loss that depends on the output
+                dummy_loss = output[0].sum() 
+
+            dummy_loss.backward()
+            optimizer.step()
             
-            print(f"✅ {bcolors.OKGREEN}Batch size {batch_size} (forward pass) fits in memory. Trying next size...{bcolors.ENDC}")
+            print(f"✅ {bcolors.OKGREEN}Batch size {batch_size} (full pass) fits in memory. Trying next size...{bcolors.ENDC}")
             
-            del images, dataloader
+            del images, dataloader, optimizer, output, dummy_loss
             batch_size *= 2
             torch.cuda.empty_cache()
 
         except torch.cuda.OutOfMemoryError:
-            # The backward pass requires memory for gradients. Since we skipped it,
-            # we apply a fudge factor to the last successful batch size to be safe.
-            fudge_factor = 0.7 
-            last_successful_size = batch_size // 2
-            max_size = int(last_successful_size * fudge_factor)
-            
-            print(f"⚠️ {bcolors.WARNING}OOM at batch size {batch_size}. Last successful size was {last_successful_size}.{bcolors.ENDC}")
-            print(f"   {bcolors.WARNING}Applying safety factor ({fudge_factor}) for gradient memory. Optimal batch size estimated as: {max_size}{bcolors.ENDC}")
+            max_size = batch_size // 2
+            print(f"⚠️ {bcolors.WARNING}OOM at batch size {batch_size}. Optimal batch size set to: {max_size}{bcolors.ENDC}")
             torch.cuda.empty_cache()
             return max(1, max_size) # Ensure batch size is at least 1
         except StopIteration:
+            # This case should ideally not be hit with the dummy dataset
             print(f"✅ {bcolors.OKGREEN}Batch size {batch_size} fits, but dataset is too small to double.{bcolors.ENDC}")
             return batch_size
 
@@ -190,7 +200,6 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
 
     optimizer = torch.optim.Adam([adversarial_patch], lr=learning_rate, amsgrad=True)
     scaler = torch.amp.GradScaler(enabled=(device.type == 'cuda'))
-    # FIX: Removed the 'verbose' argument which is deprecated in newer PyTorch versions.
     scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=PLATEAU_PATIENCE)
     total_variation = TotalVariationLoss().to(device)
 
@@ -359,18 +368,12 @@ if __name__ == '__main__':
             temp_model.model = torch.nn.DataParallel(temp_model.model)
         temp_model.model.train()
         
-        transform = T.Compose([T.Resize((640, 640)), T.ToTensor()])
-        # Use a smaller subset of the dataset for a faster autotune initialization
-        full_dataset = VisDroneDataset(root_dir=DATASET_PATH, transform=transform)
-        subset_indices = list(range(min(len(full_dataset), 2048)))
-        autotune_dataset = torch.utils.data.Subset(full_dataset, subset_indices)
-        
         final_batch_size = autotune_batch_size(
             device=device, 
             model=temp_model, 
-            dataset=autotune_dataset
+            dataset=DummyDataset() # The dataset is only used for its length now
         )
-        del temp_model, full_dataset, autotune_dataset
+        del temp_model
         torch.cuda.empty_cache()
     else:
         print("Autotune is only for CUDA. Using base batch size.")
