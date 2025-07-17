@@ -59,11 +59,10 @@ def apply_patch_to_image_partial(image_pil, patch_pil, box):
     if box_w <= 0 or box_h <= 0: return patched_image
     
     # Scale patch based on the smaller dimension of the box
-    base_size = min(box_w, box_h)
     scale = random.uniform(0.4, 0.7)
     
     # The patch will be a square
-    patch_side_length = int(base_size * scale)
+    patch_side_length = int(min(box_w, box_h) * scale)
     if patch_side_length == 0: return patched_image
     
     # Resize the patch to be a square of the calculated side length
@@ -78,11 +77,9 @@ def apply_patch_to_image_partial(image_pil, patch_pil, box):
     base_paste_y = center_y - (patch_side_length / 2)
 
     # Add a random jitter, allowing the patch to move by up to 20% of its size from the center
-    max_jitter_x = int(patch_side_length * 0.2)
-    max_jitter_y = int(patch_side_length * 0.2)
-
-    jitter_x = random.randint(-max_jitter_x, max_jitter_x)
-    jitter_y = random.randint(-max_jitter_y, max_jitter_y)
+    max_jitter = int(patch_side_length * 0.2)
+    jitter_x = random.randint(-max_jitter, max_jitter)
+    jitter_y = random.randint(-max_jitter, max_jitter)
 
     paste_x = int(base_paste_x + jitter_x)
     paste_y = int(base_paste_y + jitter_y)
@@ -104,16 +101,16 @@ def draw_boxes(image_pil, boxes, color="lime", confidences=None):
         if confidences is not None:
             label = f"Conf: {confidences[i]:.2f}"
             try:
-                # A more robust way to draw text background
                 text_bbox = draw.textbbox((x1, y1 - 12), label)
                 draw.rectangle(text_bbox, fill=color)
                 draw.text((x1, y1 - 12), label, fill="black")
             except Exception: # Fallback for older versions
                 draw.text((x1, y1 - 5), label, fill=color)
 
+# ✅ OVERHAUL: Optimized evaluation function using batch processing
 def run_evaluation(model, patch_path, dataset_path, conf_threshold, num_eval_images, seed, visualize=False, visual_limit=10):
     """
-    The single, definitive evaluation function with optional visualization.
+    The single, definitive evaluation function, optimized for speed using batch inference.
     """
     if seed is not None:
         print(f"Running evaluation with fixed seed: {seed}")
@@ -122,8 +119,6 @@ def run_evaluation(model, patch_path, dataset_path, conf_threshold, num_eval_ima
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
-
-    model.model.eval()
     
     try:
         patch_pil = Image.open(patch_path).convert("RGB")
@@ -136,7 +131,6 @@ def run_evaluation(model, patch_path, dataset_path, conf_threshold, num_eval_ima
         print(f"❌ Error: No validation images found in '{dataset_path}'.")
         return 0.0
 
-    # --- NEW: Create a unique directory for visual outputs for this run ---
     output_dir = None
     if visualize:
         timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
@@ -145,67 +139,69 @@ def run_evaluation(model, patch_path, dataset_path, conf_threshold, num_eval_ima
         os.makedirs(output_dir, exist_ok=True)
         print(f"💾 Saving visualization images to '{output_dir}'")
 
-    if num_eval_images == -1:
-        eval_indices = range(len(dataset))
-        print(f"  - Evaluating on all {len(dataset)} validation images.")
-    else:
-        num_to_eval = min(num_eval_images, len(dataset))
-        eval_indices = random.sample(range(len(dataset)), num_to_eval)
-        print(f"  - Evaluating on a random sample of {num_to_eval} validation images.")
+    eval_indices = range(len(dataset))
+    print(f"  - Evaluating on all {len(dataset)} validation images.")
 
     total_attacks, successful_attacks, saved_visuals_count = 0, 0, 0
     
-    for idx in tqdm(eval_indices, desc="Evaluating Patch", leave=False):
+    # Use tqdm for the main loop to show progress on the evaluation itself
+    for idx in tqdm(eval_indices, desc="  Evaluating Patch", leave=False, file=sys.__stdout__):
         original_image_pil, gt_boxes, img_path = dataset[idx]
         
         if not gt_boxes:
             continue
         
-        results_before = model(original_image_pil, conf=conf_threshold, verbose=False)
-        num_boxes_before = len(results_before[0].boxes)
+        # INFERENCE 1: Run on the clean image to get the baseline detection count
+        results_before_list = model(original_image_pil, conf=conf_threshold, verbose=False)
+        num_boxes_before = len(results_before_list[0].boxes)
 
-        for i, gt_box in enumerate(gt_boxes):
-            total_attacks += 1
-            patched_image_pil = apply_patch_to_image_partial(original_image_pil, patch_pil, gt_box)
-            
-            results_after = model(patched_image_pil, conf=conf_threshold, verbose=False)
-            num_boxes_after = len(results_after[0].boxes)
-            
-            if num_boxes_after < num_boxes_before:
-                 successful_attacks += 1
-                 attack_status = "SUCCESS"
-            else:
-                 attack_status = "FAIL"
+        if num_boxes_before == 0:
+            continue
 
-            # --- NEW: Visualization logic ---
+        # BATCH PREPARATION: Create a batch of images, each with the patch applied over a different GT box
+        patched_images_batch = [apply_patch_to_image_partial(original_image_pil, patch_pil, gt_box) for gt_box in gt_boxes]
+
+        if not patched_images_batch:
+            continue
+
+        total_attacks += len(patched_images_batch)
+
+        # INFERENCE 2: Run on the entire batch of patched images
+        results_after_list = model(patched_images_batch, conf=conf_threshold, verbose=False)
+
+        # PROCESS BATCH RESULTS: Compare each patched result to the original
+        for i, results_after in enumerate(results_after_list):
+            num_boxes_after = len(results_after.boxes)
+            is_success = num_boxes_after < num_boxes_before
+            
+            if is_success:
+                successful_attacks += 1
+            
             if visualize and (visual_limit == -1 or saved_visuals_count < visual_limit):
-                # Create "Before" image with GT box
-                img_before_with_box = original_image_pil.copy()
-                draw_boxes(img_before_with_box, [gt_box], color="red")
-
-                # Create "After" image with YOLO detections
-                img_after_with_detections = patched_image_pil.copy()
-                draw_boxes(img_after_with_detections, 
-                           results_after[0].boxes.xyxy.cpu().numpy(), 
-                           color="lime", 
-                           confidences=results_after[0].boxes.conf.cpu().numpy())
+                attack_status = "SUCCESS" if is_success else "FAIL"
+                gt_box_for_vis = gt_boxes[i]
                 
-                # Combine images side-by-side
+                img_before_with_box = original_image_pil.copy()
+                draw_boxes(img_before_with_box, [gt_box_for_vis], color="red")
+
+                # The 'results_after.orig_img' is the patched image as a numpy array
+                img_after_with_detections = Image.fromarray(results_after.orig_img[:,:,::-1]) # BGR to RGB
+                draw_boxes(img_after_with_detections, 
+                           results_after.boxes.xyxy.cpu().numpy(), 
+                           color="lime", 
+                           confidences=results_after.boxes.conf.cpu().numpy())
+                
                 comparison_img = Image.new('RGB', (original_image_pil.width * 2, original_image_pil.height))
                 comparison_img.paste(img_before_with_box, (0, 0))
                 comparison_img.paste(img_after_with_detections, (original_image_pil.width, 0))
                 
-                # Add text labels
                 draw = ImageDraw.Draw(comparison_img)
                 draw.text((10, 10), "Before (Ground Truth)", fill="red")
                 draw.text((original_image_pil.width + 10, 10), f"After (YOLO Detections) - {attack_status}", fill="lime")
 
-                # Save the comparison image
                 base_filename = os.path.splitext(os.path.basename(img_path))[0]
                 comparison_img.save(os.path.join(output_dir, f"{base_filename}_attack_{i}_{attack_status}.png"))
                 saved_visuals_count += 1
-
-    torch.cuda.empty_cache()
 
     if total_attacks == 0: return 0.0
     return (successful_attacks / total_attacks) * 100.0
