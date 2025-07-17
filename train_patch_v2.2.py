@@ -47,47 +47,70 @@ class bcolors:
 
 # --- Dataset Classes ---
 class VisDroneDataset(Dataset):
-    """Loads images AND their corresponding bounding box annotations."""
+    """
+    Loads the entire VisDrone dataset into RAM to eliminate disk I/O bottlenecks during training.
+    """
     def __init__(self, root_dir, transform=None):
-        self.root_dir = root_dir
         self.transform = transform
-        self.image_dir = os.path.join(root_dir, 'images')
-        self.annotation_dir = os.path.join(root_dir, 'annotations_v11')
-        self.image_files = sorted(os.listdir(self.image_dir))
+        self.images = []
+        self.annotations = []
+
+        image_dir = os.path.join(root_dir, 'images')
+        annotation_dir = os.path.join(root_dir, 'annotations_v11')
+        image_files = sorted(os.listdir(image_dir))
+
+        print(f"⏳ {bcolors.HEADER}Pre-loading dataset into RAM... This may take a moment.{bcolors.ENDC}")
+        
+        for img_name in tqdm(image_files, desc="Loading Data"):
+            img_path = os.path.join(image_dir, img_name)
+            # Load image and store it in memory
+            try:
+                with Image.open(img_path) as img:
+                    self.images.append(img.convert("RGB"))
+            except Exception as e:
+                print(f"Warning: Could not load image {img_path}. Skipping. Error: {e}")
+                continue
+
+            # Load annotations and store them in memory
+            boxes = []
+            annotation_name = os.path.splitext(img_name)[0] + '.txt'
+            annotation_path = os.path.join(annotation_dir, annotation_name)
+            
+            if os.path.exists(annotation_path):
+                with open(annotation_path, 'r') as f:
+                    for line in f.readlines():
+                        try:
+                            parts = line.strip().split(',')
+                            if len(parts) >= 4:
+                                x1, y1, w, h = float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
+                                boxes.append([x1, y1, x1 + w, y1 + h])
+                        except (ValueError, IndexError):
+                            continue
+            
+            self.annotations.append(torch.tensor(boxes, dtype=torch.float32))
+        
+        print(f"✅ {bcolors.OKGREEN}Dataset pre-loaded successfully. {len(self.images)} images in memory.{bcolors.ENDC}")
 
     def __len__(self):
-        return len(self.image_files)
+        return len(self.images)
 
     def __getitem__(self, idx):
-        img_name = self.image_files[idx]
-        img_path = os.path.join(self.image_dir, img_name)
-        image = Image.open(img_path).convert("RGB")
+        # Get pre-loaded image and annotations
+        image = self.images[idx]
+        boxes = self.annotations[idx]
         original_size = image.size
 
-        boxes = []
-        annotation_name = os.path.splitext(img_name)[0] + '.txt'
-        annotation_path = os.path.join(self.annotation_dir, annotation_name)
-        
-        if os.path.exists(annotation_path):
-            with open(annotation_path, 'r') as f:
-                for line in f.readlines():
-                    try:
-                        parts = line.strip().split(',')
-                        if len(parts) >= 4:
-                            x1, y1, w, h = float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
-                            boxes.append([x1, y1, x1 + w, y1 + h])
-                    except (ValueError, IndexError):
-                        continue
-        
-        boxes = torch.tensor(boxes, dtype=torch.float32)
-
+        # Apply transformations on-the-fly
         if self.transform:
             image = self.transform(image)
         
+        # Scale bounding boxes to the new image size (640x640)
         if boxes.nelement() > 0:
             scale_x, scale_y = 640 / original_size[0], 640 / original_size[1]
-            boxes[:, [0, 2]] *= scale_x
-            boxes[:, [1, 3]] *= scale_y
+            scaled_boxes = boxes.clone()
+            scaled_boxes[:, [0, 2]] *= scale_x
+            scaled_boxes[:, [1, 3]] *= scale_y
+            return image, scaled_boxes
 
         return image, boxes
 
@@ -130,15 +153,12 @@ def autotune_batch_size(device, model, dataset, initial_batch_size=2):
              return batch_size // 2
 
         try:
-            # Use a dummy dataset to avoid disk I/O overhead
             dummy_data = DummyDataset(length=batch_size)
             dataloader = DataLoader(dummy_data, batch_size=batch_size)
             images = next(iter(dataloader))
             images = images.to(device)
-            
             images.requires_grad_(True)
 
-            # --- Perform a minimal forward and backward pass to test VRAM for activations AND gradients ---
             with torch.amp.autocast(device.type):
                 output = model.model(images)
                 dummy_loss = output[0].sum() 
@@ -155,7 +175,7 @@ def autotune_batch_size(device, model, dataset, initial_batch_size=2):
             max_size = batch_size // 2
             print(f"⚠️ {bcolors.WARNING}OOM at batch size {batch_size}. Optimal batch size set to: {max_size}{bcolors.ENDC}")
             torch.cuda.empty_cache()
-            return max(1, max_size) # Ensure batch size is at least 1
+            return max(1, max_size) 
         except StopIteration:
             print(f"✅ {bcolors.OKGREEN}Batch size {batch_size} fits, but dataset is too small to double.{bcolors.ENDC}")
             return batch_size
@@ -168,10 +188,8 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
     model = YOLO(MODEL_NAME)
     model.to(device)
     
-    # This will now respect the --gpu_ids argument by default
-    if torch.cuda.device_count() > 1:
-        print(f"🚀 {bcolors.HEADER}Using {torch.cuda.device_count()} GPUs!{bcolors.ENDC}")
-        model.model = torch.nn.DataParallel(model.model)
+    if isinstance(model.model, torch.nn.DataParallel):
+        print(f"🚀 {bcolors.HEADER}Using DataParallel on {torch.cuda.device_count()} specified GPUs!{bcolors.ENDC}")
 
     model.model.train()
 
@@ -214,8 +232,9 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
     num_workers = min(os.cpu_count() // 2, 16) if os.cpu_count() else 4
     pin_memory = (device.type == 'cuda')
     def collate_fn(batch):
-        images = [item[0] for item in batch]
-        boxes = [item[1] for item in batch]
+        images = [item[0] for item in batch if item is not None]
+        boxes = [item[1] for item in batch if item is not None]
+        if not images: return None, None
         return torch.stack(images, 0), boxes
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_fn)
@@ -238,6 +257,7 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{max_epochs}", ncols=120)
 
         for i, (images, gt_boxes_batch) in enumerate(progress_bar):
+            if images is None: continue
             images = images.to(device, non_blocking=pin_memory)
             
             angle, scale = random.uniform(-15, 15), random.uniform(0.8, 1.2)
@@ -282,8 +302,8 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
                 best_loss=f"{best_loss:.4f}"
             )
 
-        avg_adv_loss = total_adv_loss / len(dataloader)
-        avg_tv_loss = total_tv_loss / len(dataloader)
+        avg_adv_loss = total_adv_loss / len(dataloader) if len(dataloader) > 0 else 0
+        avg_tv_loss = total_tv_loss / len(dataloader) if len(dataloader) > 0 else 0
         avg_total_loss = avg_adv_loss + tv_weight * avg_tv_loss
         epoch_duration = time.time() - epoch_start_time
         
@@ -313,7 +333,7 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
             epochs_no_improve += 1
 
         if epochs_no_improve >= EARLY_STOPPING_PATIENCE:
-            print(f"\n� {bcolors.FAIL}{bcolors.BOLD}Early stopping triggered after {EARLY_STOPPING_PATIENCE} epochs with no improvement.{bcolors.ENDC}")
+            print(f"\n🛑 {bcolors.FAIL}{bcolors.BOLD}Early stopping triggered after {EARLY_STOPPING_PATIENCE} epochs with no improvement.{bcolors.ENDC}")
             print(f"   Best loss achieved: {best_loss:.4f}")
             break
 
@@ -336,11 +356,10 @@ if __name__ == '__main__':
     parser.add_argument('--tv_weight', type=float, default=1e-4, help='Weight for the Total Variation loss term.')
     parser.add_argument('--max_epochs', type=int, default=DEFAULT_MAX_EPOCHS, help='Maximum number of epochs to train for.')
     parser.add_argument('--early_stopping_patience', type=int, default=EARLY_STOPPING_PATIENCE, help='Number of epochs with no improvement to wait before stopping.')
-    # FIX: Add argument to specify which GPUs to use, reducing communication overhead.
-    parser.add_argument('--gpu_ids', type=int, nargs='+', default=None, help='Specific GPU IDs to use (e.g., 0 1 2). Defaults to all available GPUs.')
+    parser.add_argument('--gpu_ids', type=int, nargs='+', default=None, help='Specific GPU IDs to use (e.g., 0 1 2). If not specified, uses single GPU. If multiple IDs are given, enables DataParallel.')
     args = parser.parse_args()
 
-    # FIX: Set CUDA_VISIBLE_DEVICES before any torch operations to control which GPUs are used.
+    # Set CUDA_VISIBLE_DEVICES to control which GPUs are visible to PyTorch
     if args.gpu_ids:
         os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, args.gpu_ids))
         print(f"✅ {bcolors.OKGREEN}Running on specified GPUs: {os.environ['CUDA_VISIBLE_DEVICES']}{bcolors.ENDC}")
@@ -366,7 +385,8 @@ if __name__ == '__main__':
     elif device.type == 'cuda':
         print(f"🛠️ {bcolors.HEADER}Preparing for autotune...{bcolors.ENDC}")
         temp_model = YOLO(MODEL_NAME).to(device)
-        if torch.cuda.device_count() > 1:
+        # FIX: Only wrap in DataParallel if multiple GPUs are explicitly requested
+        if args.gpu_ids and len(args.gpu_ids) > 1:
             temp_model.model = torch.nn.DataParallel(temp_model.model)
         temp_model.model.train()
         
@@ -381,7 +401,10 @@ if __name__ == '__main__':
         print("Autotune is only for CUDA. Using base batch size.")
         final_batch_size = BASE_BATCH_SIZE
 
-    scaled_lr = BASE_LEARNING_RATE * (final_batch_size / BASE_BATCH_SIZE)
+    # Scale learning rate based on the effective batch size (total across all GPUs)
+    num_gpus = len(args.gpu_ids) if args.gpu_ids else 1
+    effective_batch_size = final_batch_size * num_gpus
+    scaled_lr = BASE_LEARNING_RATE * (effective_batch_size / BASE_BATCH_SIZE)
     
     session_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_dir = os.path.join(parent_log_dir, session_timestamp)
