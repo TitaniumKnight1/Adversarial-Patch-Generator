@@ -136,16 +136,11 @@ def autotune_batch_size(device, model, dataset, initial_batch_size=2):
             images = next(iter(dataloader))
             images = images.to(device)
             
-            # FIX: Set requires_grad on the input tensor. This ensures a computation
-            # graph is built, allowing the backward pass to run and accurately
-            # measure memory usage for gradients, which solves the RuntimeError.
             images.requires_grad_(True)
 
             # --- Perform a minimal forward and backward pass to test VRAM for activations AND gradients ---
             with torch.amp.autocast(device.type):
-                # We only need the model output to compute a dummy loss
                 output = model.model(images)
-                # The simplest possible loss that depends on the output
                 dummy_loss = output[0].sum() 
 
             dummy_loss.backward()
@@ -162,7 +157,6 @@ def autotune_batch_size(device, model, dataset, initial_batch_size=2):
             torch.cuda.empty_cache()
             return max(1, max_size) # Ensure batch size is at least 1
         except StopIteration:
-            # This case should ideally not be hit with the dummy dataset
             print(f"✅ {bcolors.OKGREEN}Batch size {batch_size} fits, but dataset is too small to double.{bcolors.ENDC}")
             return batch_size
 
@@ -174,6 +168,7 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
     model = YOLO(MODEL_NAME)
     model.to(device)
     
+    # This will now respect the --gpu_ids argument by default
     if torch.cuda.device_count() > 1:
         print(f"🚀 {bcolors.HEADER}Using {torch.cuda.device_count()} GPUs!{bcolors.ENDC}")
         model.model = torch.nn.DataParallel(model.model)
@@ -189,7 +184,7 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
             print(f"⚠️ {bcolors.WARNING}torch.compile() failed: {e}. Running without compilation.{bcolors.ENDC}")
 
     if starter_image_path and os.path.exists(starter_image_path):
-        print(f"� {bcolors.OKCYAN}Initializing patch from starter image: {starter_image_path}{bcolors.ENDC}")
+        print(f"🌱 {bcolors.OKCYAN}Initializing patch from starter image: {starter_image_path}{bcolors.ENDC}")
         starter_image = Image.open(starter_image_path).convert("RGB")
         transform_starter = T.Compose([T.Resize((PATCH_SIZE, PATCH_SIZE)), T.ToTensor()])
         adversarial_patch = transform_starter(starter_image).to(device)
@@ -318,7 +313,7 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
             epochs_no_improve += 1
 
         if epochs_no_improve >= EARLY_STOPPING_PATIENCE:
-            print(f"\n🛑 {bcolors.FAIL}{bcolors.BOLD}Early stopping triggered after {EARLY_STOPPING_PATIENCE} epochs with no improvement.{bcolors.ENDC}")
+            print(f"\n� {bcolors.FAIL}{bcolors.BOLD}Early stopping triggered after {EARLY_STOPPING_PATIENCE} epochs with no improvement.{bcolors.ENDC}")
             print(f"   Best loss achieved: {best_loss:.4f}")
             break
 
@@ -335,6 +330,21 @@ def send_crash_notification(error_message):
 
 # --- Main execution block ---
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Train adversarial patches against a YOLO model with automatic LR scaling and early stopping.")
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume a specific run.')
+    parser.add_argument('--starter_image', type=str, default=None, help='Path to an image to use as the starting point for the patch.')
+    parser.add_argument('--tv_weight', type=float, default=1e-4, help='Weight for the Total Variation loss term.')
+    parser.add_argument('--max_epochs', type=int, default=DEFAULT_MAX_EPOCHS, help='Maximum number of epochs to train for.')
+    parser.add_argument('--early_stopping_patience', type=int, default=EARLY_STOPPING_PATIENCE, help='Number of epochs with no improvement to wait before stopping.')
+    # FIX: Add argument to specify which GPUs to use, reducing communication overhead.
+    parser.add_argument('--gpu_ids', type=int, nargs='+', default=None, help='Specific GPU IDs to use (e.g., 0 1 2). Defaults to all available GPUs.')
+    args = parser.parse_args()
+
+    # FIX: Set CUDA_VISIBLE_DEVICES before any torch operations to control which GPUs are used.
+    if args.gpu_ids:
+        os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, args.gpu_ids))
+        print(f"✅ {bcolors.OKGREEN}Running on specified GPUs: {os.environ['CUDA_VISIBLE_DEVICES']}{bcolors.ENDC}")
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == 'cpu':
         print(f"⚠️ {bcolors.WARNING}CUDA not available. Running on CPU. This will be very slow.{bcolors.ENDC}")
@@ -343,14 +353,6 @@ if __name__ == '__main__':
     if not os.path.exists(parent_log_dir): os.makedirs(parent_log_dir)
     tb = program.TensorBoard(); tb.configure(argv=[None, '--logdir', parent_log_dir]); url = tb.launch()
     print("\n" + "="*60 + f"\n📈 {bcolors.BOLD}TensorBoard is running: {bcolors.OKBLUE}{url}{bcolors.ENDC}\n" + "="*60 + "\n")
-
-    parser = argparse.ArgumentParser(description="Train adversarial patches against a YOLO model with automatic LR scaling and early stopping.")
-    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume a specific run.')
-    parser.add_argument('--starter_image', type=str, default=None, help='Path to an image to use as the starting point for the patch.')
-    parser.add_argument('--tv_weight', type=float, default=1e-4, help='Weight for the Total Variation loss term.')
-    parser.add_argument('--max_epochs', type=int, default=DEFAULT_MAX_EPOCHS, help='Maximum number of epochs to train for.')
-    parser.add_argument('--early_stopping_patience', type=int, default=EARLY_STOPPING_PATIENCE, help='Number of epochs with no improvement to wait before stopping.')
-    args = parser.parse_args()
 
     if args.starter_image and args.resume: 
         print(f"{bcolors.FAIL}Error: --starter_image and --resume cannot be used together.{bcolors.ENDC}"); sys.exit(1)
@@ -406,3 +408,4 @@ if __name__ == '__main__':
         error_info = "".join(traceback.format_exception(type(e), e, e.__traceback__))
         send_crash_notification(error_info)
         raise e
+�
