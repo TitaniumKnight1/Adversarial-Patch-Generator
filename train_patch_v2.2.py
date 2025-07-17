@@ -91,12 +91,6 @@ class VisDroneDataset(Dataset):
 
         return image, boxes
 
-class DummyDataset(Dataset):
-    """A simple dummy dataset for the autotune memory test."""
-    def __init__(self, length=256): self.length = length
-    def __len__(self): return self.length
-    def __getitem__(self, idx): return torch.rand(3, 640, 640)
-
 # --- Loss Functions ---
 class TotalVariationLoss(torch.nn.Module):
     """Calculates the total variation of an image, encouraging smoothness."""
@@ -111,33 +105,81 @@ class TotalVariationLoss(torch.nn.Module):
         return (wh_diff + ww_diff) / (patch.size(2) * patch.size(3))
 
 # --- Autotune Function ---
-def autotune_batch_size(device, model, dataset, initial_batch_size=2):
+def autotune_batch_size(device, model, dataset, tv_weight, initial_batch_size=2):
+    """
+    Simulates a full training step to find the largest batch size that fits in VRAM.
+    """
     batch_size = initial_batch_size
-    print(f"🚀 {bcolors.HEADER}Starting batch size autotune from size {batch_size}...{bcolors.ENDC}")
+    print(f"� {bcolors.HEADER}Starting batch size autotune from size {batch_size}...{bcolors.ENDC}")
+    print(f"   {bcolors.WARNING}This will simulate a full training step to accurately measure VRAM.{bcolors.ENDC}")
+    
+    # Use the same collate_fn as in the main training loop
+    def collate_fn(batch):
+        images = [item[0] for item in batch]
+        boxes = [item[1] for item in batch]
+        return torch.stack(images, 0), boxes
+        
+    total_variation = TotalVariationLoss().to(device)
+
     while True:
+        # Prevent batch size from exceeding dataset size
+        if batch_size > len(dataset):
+             print(f"✅ {bcolors.OKGREEN}Batch size ({batch_size}) exceeds dataset size ({len(dataset)}). Using previous valid size.{bcolors.ENDC}")
+             return batch_size // 2
+
         try:
-            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-            images = next(iter(dataloader)).to(device)
+            # Create all necessary components for a single training step
+            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+            images, gt_boxes_batch = next(iter(dataloader))
+            images = images.to(device)
+            
             dummy_patch = torch.rand((3, PATCH_SIZE, PATCH_SIZE), device=device, requires_grad=True)
             optimizer = torch.optim.Adam([dummy_patch], lr=0.01)
+            scaler = torch.amp.GradScaler(enabled=(device.type == 'cuda'))
 
-            for j in range(min(images.size(0), batch_size)):
-                 x, y = random.randint(0, 640 - PATCH_SIZE), random.randint(0, 640 - PATCH_SIZE)
-                 images[j, :, x:x+PATCH_SIZE, y:y+PATCH_SIZE] = dummy_patch
+            # --- Replicate the exact patch application and transformation logic ---
+            angle, scale = random.uniform(-15, 15), random.uniform(0.8, 1.2)
+            transformed_patch = TF.rotate(dummy_patch, angle)
+            transformed_patch = TF.resize(transformed_patch, (int(PATCH_SIZE * scale), int(PATCH_SIZE * scale)))
+            transformed_patch = TF.center_crop(transformed_patch, (PATCH_SIZE, PATCH_SIZE))
+            transformed_patch = TF.adjust_brightness(transformed_patch, random.uniform(0.7, 1.3))
+            transformed_patch = TF.adjust_contrast(transformed_patch, random.uniform(0.7, 1.3))
+            transformed_patch.data.clamp_(0,1)
 
+            for img_idx in range(images.size(0)):
+                gt_boxes = gt_boxes_batch[img_idx]
+                if len(gt_boxes) > 0:
+                    box = gt_boxes[random.randint(0, len(gt_boxes) - 1)].int()
+                    center_x, center_y = random.randint(box[0], box[2]), random.randint(box[1], box[3])
+                    patch_x = max(0, min(center_x - PATCH_SIZE // 2, images.shape[3] - PATCH_SIZE))
+                    patch_y = max(0, min(center_y - PATCH_SIZE // 2, images.shape[2] - PATCH_SIZE))
+                    images[img_idx, :, patch_y:patch_y+PATCH_SIZE, patch_x:patch_x+PATCH_SIZE] = transformed_patch
+                else:
+                    x_start, y_start = random.randint(0, 640 - PATCH_SIZE), random.randint(0, 640 - PATCH_SIZE)
+                    images[img_idx, :, y_start:y_start+PATCH_SIZE, x_start:x_start+PATCH_SIZE] = transformed_patch
+
+            # --- Replicate the exact forward and backward pass ---
+            optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device.type):
                 raw_preds = model.model(images)[0].transpose(1, 2)
-                loss = torch.mean(torch.max(raw_preds[..., 4:], dim=-1)[0])
+                adv_loss = -torch.mean(torch.max(raw_preds[..., 4:], dim=-1)[0])
+                tv_loss = total_variation(dummy_patch)
+                total_loss = adv_loss + tv_weight * tv_loss
 
-            loss.backward()
-            optimizer.zero_grad(set_to_none=True)
-            print(f"✅ {bcolors.OKGREEN}Batch size {batch_size} fits in memory. Trying next size...{bcolors.ENDC}")
-            del images, raw_preds, loss, dummy_patch, optimizer
-            batch_size *= 2
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
+            print(f"✅ {bcolors.OKGREEN}Batch size {batch_size} fits in memory. Trying next size...{bcolors.ENDC}")
+            
+            # Cleanup to free memory for the next test
+            del images, gt_boxes_batch, raw_preds, total_loss, dummy_patch, optimizer, scaler, dataloader
+            batch_size *= 2
+            torch.cuda.empty_cache()
+
         except torch.cuda.OutOfMemoryError:
             max_size = batch_size // 2
-            print(f"⚠️ {bcolors.WARNING}OOM at {batch_size}. Optimal batch size set to: {max_size}{bcolors.ENDC}")
+            print(f"⚠️ {bcolors.WARNING}OOM at batch size {batch_size}. Optimal batch size set to: {max_size}{bcolors.ENDC}")
             torch.cuda.empty_cache()
             return max_size
         except StopIteration:
@@ -152,9 +194,6 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
     model = YOLO(MODEL_NAME)
     model.to(device)
     
-    # --- Multi-GPU Preparation ---
-    # If you have multiple GPUs, you can wrap the model with DataParallel.
-    # The script will automatically use all available GPUs for inference.
     if torch.cuda.device_count() > 1:
         print(f"🚀 {bcolors.HEADER}Using {torch.cuda.device_count()} GPUs!{bcolors.ENDC}")
         model.model = torch.nn.DataParallel(model.model)
@@ -163,8 +202,6 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
 
     if device.type == 'cuda':
         try:
-            # Note: torch.compile is not compatible with DataParallel in some versions.
-            # If using DataParallel, you might need to disable compile.
             if not isinstance(model.model, torch.nn.DataParallel):
                 model.model = torch.compile(model.model)
                 print(f"✅ {bcolors.OKGREEN}Model compiled successfully with torch.compile().{bcolors.ENDC}")
@@ -230,8 +267,7 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
             
             angle, scale = random.uniform(-15, 15), random.uniform(0.8, 1.2)
             transformed_patch = TF.rotate(adversarial_patch, angle)
-            new_size = int(PATCH_SIZE * scale)
-            transformed_patch = TF.resize(transformed_patch, (new_size, new_size))
+            transformed_patch = TF.resize(transformed_patch, (int(PATCH_SIZE * scale), int(PATCH_SIZE * scale)))
             transformed_patch = TF.center_crop(transformed_patch, (PATCH_SIZE, PATCH_SIZE))
             transformed_patch = TF.adjust_brightness(transformed_patch, random.uniform(0.7, 1.3))
             transformed_patch = TF.adjust_contrast(transformed_patch, random.uniform(0.7, 1.3))
@@ -240,10 +276,8 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
             for img_idx in range(images.size(0)):
                 gt_boxes = gt_boxes_batch[img_idx]
                 if len(gt_boxes) > 0:
-                    box_idx = random.randint(0, len(gt_boxes) - 1)
-                    box = gt_boxes[box_idx].int()
-                    x1, y1, x2, y2 = box
-                    center_x, center_y = random.randint(x1, x2), random.randint(y1, y2)
+                    box = gt_boxes[random.randint(0, len(gt_boxes) - 1)].int()
+                    center_x, center_y = random.randint(box[0], box[2]), random.randint(box[1], box[3])
                     patch_x = max(0, min(center_x - PATCH_SIZE // 2, images.shape[3] - PATCH_SIZE))
                     patch_y = max(0, min(center_y - PATCH_SIZE // 2, images.shape[2] - PATCH_SIZE))
                     images[img_idx, :, patch_y:patch_y+PATCH_SIZE, patch_x:patch_x+PATCH_SIZE] = transformed_patch
@@ -348,9 +382,23 @@ if __name__ == '__main__':
         final_batch_size = checkpoint.get('batch_size', BASE_BATCH_SIZE)
         print(f"Resuming with batch size {final_batch_size} from checkpoint.")
     elif device.type == 'cuda':
-        temp_model = YOLO(MODEL_NAME).to(device); temp_model.model.train()
-        final_batch_size = autotune_batch_size(device, temp_model, DummyDataset())
-        del temp_model; torch.cuda.empty_cache()
+        print(f"🛠️ {bcolors.HEADER}Preparing for autotune...{bcolors.ENDC}")
+        temp_model = YOLO(MODEL_NAME).to(device)
+        if torch.cuda.device_count() > 1:
+            temp_model.model = torch.nn.DataParallel(temp_model.model)
+        temp_model.model.train()
+        
+        transform = T.Compose([T.Resize((640, 640)), T.ToTensor()])
+        autotune_dataset = VisDroneDataset(root_dir=DATASET_PATH, transform=transform)
+        
+        final_batch_size = autotune_batch_size(
+            device=device, 
+            model=temp_model, 
+            dataset=autotune_dataset,
+            tv_weight=args.tv_weight
+        )
+        del temp_model, autotune_dataset
+        torch.cuda.empty_cache()
     else:
         print("Autotune is only for CUDA. Using base batch size.")
         final_batch_size = BASE_BATCH_SIZE
@@ -382,3 +430,4 @@ if __name__ == '__main__':
         error_info = "".join(traceback.format_exception(type(e), e, e.__traceback__))
         send_crash_notification(error_info)
         raise e
+�
