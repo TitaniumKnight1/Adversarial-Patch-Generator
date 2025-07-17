@@ -48,6 +48,17 @@ class bcolors:
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
 
+# --- Top-level Functions ---
+
+# FIX: Moved collate_fn to the top level. This makes it pickle-able by multiprocessing
+# workers, resolving the AttributeError.
+def collate_fn(batch):
+    """Custom collate function to handle batches with potentially empty data."""
+    images = [item[0] for item in batch if item is not None]
+    boxes = [item[1] for item in batch if item is not None]
+    if not images: return None, None
+    return torch.stack(images, 0), boxes
+
 # --- Dataset Classes ---
 class VisDroneDataset(Dataset):
     """
@@ -215,7 +226,7 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
             print(f"⚠️ {bcolors.WARNING}torch.compile() failed: {e}. Running without compilation.{bcolors.ENDC}")
 
     if starter_image_path and os.path.exists(starter_image_path):
-        print(f"🌱 {bcolors.OKCYAN}Initializing patch from starter image: {starter_image_path}{bcolors.ENDC}")
+        print(f"� {bcolors.OKCYAN}Initializing patch from starter image: {starter_image_path}{bcolors.ENDC}")
         starter_image = Image.open(starter_image_path).convert("RGB")
         transform_starter = T.Compose([T.Resize((PATCH_SIZE, PATCH_SIZE)), T.ToTensor()])
         adversarial_patch = transform_starter(starter_image).to(device)
@@ -246,12 +257,6 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
     num_workers = min(os.cpu_count() // 2, 16) if os.cpu_count() else 4
     pin_memory = (device.type == 'cuda')
     
-    def collate_fn(batch):
-        images = [item[0] for item in batch if item is not None]
-        boxes = [item[1] for item in batch if item is not None]
-        if not images: return None, None
-        return torch.stack(images, 0), boxes
-
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_fn)
 
     print(f"\n🚀 {bcolors.BOLD}Starting Adversarial Patch Training{bcolors.ENDC}")
@@ -372,11 +377,7 @@ def signal_handler(sig, frame):
 
 # --- Main execution block ---
 if __name__ == '__main__':
-    # FIX: Set the sharing strategy to 'file_system'. This is crucial for systems
-    # with low file descriptor limits, as it prevents the "Too many open files"
-    # error when using multiple DataLoader workers with a large, pre-loaded dataset.
     torch.multiprocessing.set_sharing_strategy('file_system')
-    
     torch.multiprocessing.set_start_method('spawn', force=True)
     signal.signal(signal.SIGINT, signal_handler)
 
