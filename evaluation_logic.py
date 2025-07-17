@@ -101,7 +101,6 @@ def draw_boxes(image_pil, boxes, color="lime", confidences=None):
             except Exception:
                 draw.text((x1, y1 - 5), label, fill=color)
 
-# ✅ OVERHAUL: Function now accepts status_queue and gpu_id to report live progress
 def run_evaluation(model, patch_path, dataset_path, conf_threshold, num_eval_images, seed, 
                    status_queue=None, gpu_id=None, visualize=False, visual_limit=10):
     """
@@ -139,11 +138,9 @@ def run_evaluation(model, patch_path, dataset_path, conf_threshold, num_eval_ima
 
     total_attacks, successful_attacks, saved_visuals_count = 0, 0, 0
     
-    # The internal tqdm is now disabled as progress is reported to the main table
     for idx, _ in enumerate(tqdm(eval_indices, desc="  Evaluating Patch", leave=False, disable=True)):
         original_image_pil, gt_boxes, img_path = dataset[idx]
         
-        # ✅ NEW: Report progress to the main process via the status queue
         if status_queue and (idx % 5 == 0 or idx == len(eval_indices) - 1):
             progress_percent = (idx + 1) / len(eval_indices) * 100
             status_queue.put({
