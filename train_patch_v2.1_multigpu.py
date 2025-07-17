@@ -14,11 +14,9 @@ from tensorboard import program
 import requests
 import traceback
 import sys
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from datetime import datetime
 import multiprocessing as mp
 import time
-import json
 from queue import Empty
 
 # Import the evaluation logic from the user-provided file
@@ -35,11 +33,12 @@ BASE_LR = 0.0001
 BASE_BATCH_SIZE = 8.0
 
 # --- Smart Training Config ---
-PLATEAU_PATIENCE = 5
 CHECKPOINT_FILE = "patch_checkpoint.pth"
+# ✅ NEW: Total Variation Loss weight to encourage patch smoothness
+TV_LAMBDA = 2.5e-5
 
 # --- Early Stopping Configuration ---
-EVAL_PATIENCE = 10 
+EVAL_PATIENCE = 10
 EVAL_CONF_THRESHOLD = 0.25
 
 # --- Logging and Process Setup ---
@@ -152,6 +151,13 @@ class DummyWriter:
     def add_image(self, *args, **kwargs): pass
     def close(self): pass
 
+# --- ✅ NEW: Total Variation Loss Function ---
+def total_variation_loss(patch):
+    """Calculates the Total Variation Loss for a patch to encourage smoothness."""
+    wh = patch[:, :, 1:, :] - patch[:, :, :-1, :]
+    ww = patch[:, :, :, 1:] - patch[:, :, :, :-1]
+    return torch.sum(torch.abs(wh)) + torch.sum(torch.abs(ww))
+
 # --- Adversarial Patch Training (Now runs as a separate process) ---
 def train_adversarial_patch(args_dict):
     """Main training function, designed to be run in a separate process."""
@@ -162,8 +168,8 @@ def train_adversarial_patch(args_dict):
     batch_size = args_dict['batch_size']
     learning_rate = args_dict['learning_rate']
     log_dir = args_dict['log_dir']
-    num_eval_images = args_dict['num_eval_images']
     use_tensorboard = args_dict['use_tensorboard']
+    resume_path = args_dict['resume_path']
     starter_image_path = args_dict['starter_image_path']
     status_queue = args_dict['status_queue']
     is_parallel = args_dict['is_parallel']
@@ -184,18 +190,30 @@ def train_adversarial_patch(args_dict):
             print("⚠️ torch.compile() failed. Running without compilation.")
 
     if starter_image_path and os.path.exists(starter_image_path):
+        print(f"Initializing patch from starter image: {starter_image_path}")
         starter_image = Image.open(starter_image_path).convert("RGB")
         transform_starter = T.Compose([T.Resize((PATCH_RESOLUTION, PATCH_RESOLUTION)), T.ToTensor()])
         adversarial_patch = transform_starter(starter_image).to(device)
         adversarial_patch.requires_grad_(True)
     else:
+        print("Initializing patch with random noise.")
         adversarial_patch = torch.rand((3, PATCH_RESOLUTION, PATCH_RESOLUTION), device=device, requires_grad=True)
 
     optimizer = torch.optim.Adam([adversarial_patch], lr=learning_rate)
-    scaler = torch.amp.GradScaler(device.type, enabled=(device.type == 'cuda'))
-    scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=PLATEAU_PATIENCE)
+    scaler = torch.amp.GradScaler(enabled=(device.type == 'cuda'))
 
     epoch, best_success_rate, epochs_no_improve = 0, -1.0, 0
+    
+    if resume_path and os.path.exists(resume_path):
+        print(f"Resuming training from checkpoint: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=device)
+        adversarial_patch.data = checkpoint['patch_state_dict'].to(device)
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        epoch = checkpoint['epoch']
+        best_success_rate = checkpoint.get('best_success_rate', -1.0)
+        epochs_no_improve = checkpoint.get('epochs_no_improve', 0)
+        print(f"Resumed from epoch {epoch} with best success rate of {best_success_rate:.2f}%.")
 
     transform = T.Compose([T.Resize((640, 640)), T.ToTensor()])
     dataset = VisDroneDataset(root_dir=DATASET_PATH, transform=transform)
@@ -205,9 +223,9 @@ def train_adversarial_patch(args_dict):
 
     while True:
         epoch += 1
-        total_loss = 0
+        total_epoch_loss = 0
         
-        progress_bar = tqdm(dataloader, desc=f"GPU {gpu_id} | Epoch {epoch}", leave=False, position=gpu_id, file=sys.__stdout__)
+        progress_bar = tqdm(dataloader, desc=f"GPU {gpu_id} | Epoch {epoch}", leave=False, disable=is_parallel, file=sys.__stdout__)
 
         for i, (images, gt_boxes_batch) in enumerate(progress_bar):
             if images is None: continue
@@ -240,42 +258,84 @@ def train_adversarial_patch(args_dict):
 
             with torch.amp.autocast(device.type):
                 raw_preds = training_model.model(images)[0].transpose(1, 2)
-                loss = torch.mean(torch.max(raw_preds[..., 4:], dim=-1)[0])
+                # Adversarial loss to minimize the detector's confidence
+                adversarial_loss = torch.mean(torch.max(raw_preds[..., 4:], dim=-1)[0])
+                # ✅ NEW: TV loss to encourage patch smoothness
+                tv_loss = total_variation_loss(adversarial_patch)
+                # Combine losses
+                loss = adversarial_loss + TV_LAMBDA * tv_loss
+            
             scaler.scale(loss).backward()
-            scaler.step(optimizer); scaler.update()
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad(set_to_none=True)
             adversarial_patch.data.clamp_(0, 1)
-            total_loss += loss.item()
-            current_lr = optimizer.param_groups[0]['lr']
-            progress_bar.set_postfix(adv_loss=f"{total_loss/(i+1):.4f}", lr=f"{current_lr:.1e}")
+            total_epoch_loss += loss.item()
             
-            status_queue.put({'gpu_id': gpu_id, 'epoch': epoch, 'progress': f"{i+1}/{len(dataloader)}", 'loss': f"{total_loss/(i+1):.4f}", 'best_rate': f"{best_success_rate:.2f}%", 'patience': f"{epochs_no_improve}/{EVAL_PATIENCE}"})
+            if not is_parallel:
+                progress_bar.set_postfix(adv_loss=f"{total_epoch_loss/(i+1):.4f}")
+            
+            if i % 10 == 0 or i == len(dataloader) - 1:
+                status_queue.put({
+                    'gpu_id': gpu_id, 'epoch': epoch, 'progress': f"{i+1}/{len(dataloader)}", 
+                    'loss': f"{total_epoch_loss/(i+1):.4f}", 'best_rate': f"{best_success_rate:.2f}%", 
+                    'patience': f"{epochs_no_improve}/{EVAL_PATIENCE}", 'status': 'running'
+                })
 
-        avg_loss = total_loss / len(dataloader)
-        scheduler.step(avg_loss)
-        writer.add_scalar('Loss/Adversarial', avg_loss, epoch)
+        avg_loss = total_epoch_loss / len(dataloader)
+        writer.add_scalar('Loss/Total', avg_loss, epoch)
         writer.add_image('Adversarial Patch', adversarial_patch, epoch)
         
         patch_filename = os.path.join(log_dir, f"epoch_{epoch:03d}_patch.png")
         patch_image = T.ToPILImage()(adversarial_patch.cpu())
         patch_image.save(patch_filename)
         
-        eval_model = YOLO(MODEL_NAME).to(device)
-        success_rate = run_evaluation(model=eval_model, patch_path=patch_filename, dataset_path=VALIDATION_DATASET_PATH, conf_threshold=EVAL_CONF_THRESHOLD, num_eval_images=num_eval_images, seed=42)
-        del eval_model; torch.cuda.empty_cache()
-        
+        try:
+            print(f"GPU {gpu_id}: Starting evaluation for epoch {epoch}...")
+            eval_model = YOLO(MODEL_NAME).to(device)
+            # ✅ FIX: Always evaluate on all images by setting num_eval_images to -1
+            success_rate = run_evaluation(
+                model=eval_model, 
+                patch_path=patch_filename, 
+                dataset_path=VALIDATION_DATASET_PATH, 
+                conf_threshold=EVAL_CONF_THRESHOLD, 
+                num_eval_images=-1, 
+                seed=42
+            )
+            print(f"GPU {gpu_id}: Evaluation finished. Success rate: {success_rate:.2f}%")
+            del eval_model
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"💥 GPU {gpu_id}: ERROR during evaluation for epoch {epoch}!")
+            print(traceback.format_exc())
+            success_rate = 0.0
+
         writer.add_scalar('Evaluation/SuccessRate', success_rate, epoch)
 
+        # ✅ OVERHAUL: Save the best patch based on ASR, not just the latest checkpoint
         if success_rate > best_success_rate:
             best_success_rate = success_rate
             epochs_no_improve = 0
+            print(f"GPU {gpu_id}: ✅ New best success rate: {best_success_rate:.2f}%. Saving best patch.")
+            
+            # Save the best patch image separately for easy access
+            best_patch_filename = os.path.join(log_dir, "best_patch.png")
+            best_patch_image = T.ToPILImage()(adversarial_patch.cpu())
+            best_patch_image.save(best_patch_filename)
+            
+            # Also save the full checkpoint
+            checkpoint = {
+                'epoch': epoch, 'patch_state_dict': adversarial_patch.data.clone(), 
+                'optimizer_state_dict': optimizer.state_dict(), 'scaler_state_dict': scaler.state_dict(), 
+                'batch_size': batch_size, 'best_success_rate': best_success_rate, 
+                'epochs_no_improve': epochs_no_improve
+            }
+            torch.save(checkpoint, os.path.join(log_dir, CHECKPOINT_FILE))
         else:
             epochs_no_improve += 1
-
-        checkpoint = {'epoch': epoch, 'patch_state_dict': adversarial_patch.data.clone(), 'optimizer_state_dict': optimizer.state_dict(), 'scaler_state_dict': scaler.state_dict(), 'scheduler_state_dict': scheduler.state_dict(), 'batch_size': batch_size, 'best_success_rate': best_success_rate, 'epochs_no_improve': epochs_no_improve}
-        torch.save(checkpoint, os.path.join(log_dir, CHECKPOINT_FILE))
         
         if epochs_no_improve >= EVAL_PATIENCE:
+            print(f"GPU {gpu_id}: Early stopping triggered after {EVAL_PATIENCE} epochs with no improvement.")
             status_queue.put({'gpu_id': gpu_id, 'status': 'stopped', 'best_rate': f"{best_success_rate:.2f}%", 'epoch': epoch})
             break
 
@@ -295,20 +355,11 @@ if __name__ == '__main__':
     except RuntimeError:
         pass 
 
-    def eval_images_type(value):
-        if value.lower() == 'all': return -1
-        try:
-            ivalue = int(value)
-            if ivalue <= 0 and ivalue != -1: raise argparse.ArgumentTypeError(f"invalid positive int value: '{value}'")
-            return ivalue
-        except ValueError:
-            raise argparse.ArgumentTypeError(f"invalid value: '{value}', must be an integer or 'all'")
-
     parser = argparse.ArgumentParser(description="Train adversarial patches against a YOLO model.")
     parser.add_argument('--batch_size', type=int, default=8, help='Set the training batch size PER GPU.')
     parser.add_argument('--autotune', action='store_true', help='Automatically find the best batch size PER GPU.')
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume a specific run (only for single GPU).')
     parser.add_argument('--starter_image', type=str, default=None, help='Path to an image to use as the starting patch.')
-    parser.add_argument('--num_eval_images', type=eval_images_type, default=100, help="Number of images for evaluation, or 'all'.")
     parser.add_argument('--no_tensorboard', action='store_true', help='Disable TensorBoard logging and launch.')
     parser.add_argument('--parallel', action='store_true', help='Run one training process per available GPU in parallel.')
     args = parser.parse_args()
@@ -318,6 +369,7 @@ if __name__ == '__main__':
 
     if device.type == 'cpu': print("⚠️ CUDA not available. Running on CPU. This will be very slow.")
     if args.parallel and num_gpus < 2: print("⚠️ --parallel flag requires at least 2 GPUs. Running in single GPU mode."); args.parallel = False
+    if args.parallel and args.resume: print("⚠️ --resume is not supported in --parallel mode. Starting fresh."); args.resume = None
 
     if not args.no_tensorboard:
         parent_log_dir = "runs"
@@ -326,11 +378,12 @@ if __name__ == '__main__':
 
     session_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     session_log_dir = os.path.join("runs", session_timestamp)
+    if args.resume and os.path.exists(args.resume):
+        session_log_dir = os.path.dirname(args.resume)
     os.makedirs(session_log_dir, exist_ok=True)
     
-    processes = [] # Keep track of spawned processes
+    processes = []
 
-    # ✅ FIX: Wrap the entire execution in a try...except KeyboardInterrupt block
     try:
         # --- Parallel Execution Logic ---
         if args.parallel and num_gpus > 1:
@@ -351,10 +404,10 @@ if __name__ == '__main__':
                 lr = (batch_sizes[i] / BASE_BATCH_SIZE) * BASE_LR
                 process_args = {
                     'gpu_id': i, 'batch_size': batch_sizes[i], 'learning_rate': lr,
-                    'log_dir': run_log_dir, 'num_eval_images': args.num_eval_images,
-                    'use_tensorboard': (not args.no_tensorboard),
-                    'starter_image_path': args.starter_image, 'status_queue': status_queue,
-                    'is_parallel': True, 'log_file': os.path.join(run_log_dir, 'output.log')
+                    'log_dir': run_log_dir, 'use_tensorboard': (not args.no_tensorboard), 
+                    'resume_path': None, 'starter_image_path': args.starter_image, 
+                    'status_queue': status_queue, 'is_parallel': True, 
+                    'log_file': os.path.join(run_log_dir, 'output.log')
                 }
                 p = mp.Process(target=train_adversarial_patch, args=(process_args,))
                 processes.append(p)
@@ -362,24 +415,30 @@ if __name__ == '__main__':
 
             statuses = {i: {} for i in range(num_gpus)}
             active_processes = num_gpus
+            
+            header = "{:<6} {:<10} {:<8} {:<12} {:<12} {:<12} {:<10}".format("GPU", "Status", "Epoch", "Progress", "Adv Loss", "Best Rate", "Patience")
+            print(f"--- Live Parallel Training Status ---")
+            print(header)
+            print("-" * len(header))
+            print("\n" * num_gpus, end="")
+
             while active_processes > 0:
                 try:
                     update = status_queue.get(timeout=1)
                     gpu_id = update['gpu_id']
                     statuses[gpu_id] = update
-                    if statuses[gpu_id].get('status') in ['stopped', 'finished']:
+                    if statuses[gpu_id].get('status') in ['stopped', 'finished', 'error']:
                         active_processes -= 1
                     
-                    os.system('cls' if os.name == 'nt' else 'clear')
-                    print(f"--- Live Parallel Training Status ({datetime.now().strftime('%H:%M:%S')}) ---")
-                    print("{:<6} {:<10} {:<8} {:<12} {:<12} {:<12} {:<10}".format("GPU", "Status", "Epoch", "Progress", "Adv Loss", "Best Rate", "Patience"))
-                    print("-" * 80)
+                    print(f"\033[{num_gpus}A", end="")
                     for i in range(num_gpus):
                         s = statuses.get(i, {})
-                        status = s.get('status', 'Starting')
-                        print("{:<6} {:<10} {:<8} {:<12} {:<12} {:<12} {:<10}".format(
-                            i, status.capitalize(), s.get('epoch', '-'), s.get('progress', '-'), s.get('loss', '-'), s.get('best_rate', '-'), s.get('patience', '-')))
-                    time.sleep(1)
+                        status = s.get('status', 'Starting...')
+                        line = "{:<6} {:<10} {:<8} {:<12} {:<12} {:<12} {:<10}".format(
+                            i, status.capitalize(), s.get('epoch', '-'), s.get('progress', '-'), 
+                            s.get('loss', '-'), s.get('best_rate', '-'), s.get('patience', '-'))
+                        print(line + "\033[K")
+                    
                 except Empty:
                     if all(not p.is_alive() for p in processes): break
             
@@ -399,10 +458,10 @@ if __name__ == '__main__':
                 dummy_queue = type('Queue', (), {'put': lambda self, x: None})()
                 train_args = {
                     'gpu_id': 0, 'batch_size': final_batch_size, 'learning_rate': final_learning_rate,
-                    'log_dir': session_log_dir, 'num_eval_images': args.num_eval_images,
-                    'use_tensorboard': (not args.no_tensorboard), 'resume_path': args.resume,
-                    'starter_image_path': args.starter_image, 'status_queue': dummy_queue,
-                    'is_parallel': False, 'log_file': os.path.join(session_log_dir, 'output.log')
+                    'log_dir': session_log_dir, 'use_tensorboard': (not args.no_tensorboard), 
+                    'resume_path': args.resume, 'starter_image_path': args.starter_image, 
+                    'status_queue': dummy_queue, 'is_parallel': False, 
+                    'log_file': os.path.join(session_log_dir, 'output.log')
                 }
                 train_adversarial_patch(train_args)
 
