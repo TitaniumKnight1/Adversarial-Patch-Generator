@@ -19,8 +19,8 @@ import multiprocessing as mp
 import time
 from queue import Empty
 
-# Import the optimized evaluation logic
-from evaluation_logic_optimized import run_evaluation
+# ✅ FIX: Changed import back to the correct module name
+from evaluation_logic import run_evaluation
 
 # --- Configuration (Defaults) ---
 DATASET_PATH = 'VisDrone2019-DET-train'
@@ -309,7 +309,6 @@ def train_adversarial_patch(args_dict):
             success_rate = 0.0
             try:
                 with torch.no_grad():
-                    # ✅ NEW: Pass the status_queue and gpu_id for live progress reporting
                     success_rate = run_evaluation(
                         model=training_model,
                         patch_path=patch_filename, 
@@ -453,7 +452,6 @@ if __name__ == '__main__':
                     try:
                         update = status_queue.get_nowait()
                         gpu_id = update['gpu_id']
-                        # Only update the fields that are present in the update
                         if gpu_id in statuses:
                             statuses[gpu_id].update(update)
                         else:
