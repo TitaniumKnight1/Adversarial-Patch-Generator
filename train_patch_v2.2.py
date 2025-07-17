@@ -136,11 +136,12 @@ def autotune_batch_size(device, model, dataset, initial_batch_size=2):
             images = next(iter(dataloader))
             images = images.to(device)
             
-            # Minimal optimizer for the test
-            optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+            # FIX: Set requires_grad on the input tensor. This ensures a computation
+            # graph is built, allowing the backward pass to run and accurately
+            # measure memory usage for gradients, which solves the RuntimeError.
+            images.requires_grad_(True)
 
             # --- Perform a minimal forward and backward pass to test VRAM for activations AND gradients ---
-            optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device.type):
                 # We only need the model output to compute a dummy loss
                 output = model.model(images)
@@ -148,11 +149,10 @@ def autotune_batch_size(device, model, dataset, initial_batch_size=2):
                 dummy_loss = output[0].sum() 
 
             dummy_loss.backward()
-            optimizer.step()
             
             print(f"✅ {bcolors.OKGREEN}Batch size {batch_size} (full pass) fits in memory. Trying next size...{bcolors.ENDC}")
             
-            del images, dataloader, optimizer, output, dummy_loss
+            del images, dataloader, output, dummy_loss
             batch_size *= 2
             torch.cuda.empty_cache()
 
@@ -189,7 +189,7 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
             print(f"⚠️ {bcolors.WARNING}torch.compile() failed: {e}. Running without compilation.{bcolors.ENDC}")
 
     if starter_image_path and os.path.exists(starter_image_path):
-        print(f"🌱 {bcolors.OKCYAN}Initializing patch from starter image: {starter_image_path}{bcolors.ENDC}")
+        print(f"� {bcolors.OKCYAN}Initializing patch from starter image: {starter_image_path}{bcolors.ENDC}")
         starter_image = Image.open(starter_image_path).convert("RGB")
         transform_starter = T.Compose([T.Resize((PATCH_SIZE, PATCH_SIZE)), T.ToTensor()])
         adversarial_patch = transform_starter(starter_image).to(device)
@@ -406,3 +406,4 @@ if __name__ == '__main__':
         error_info = "".join(traceback.format_exception(type(e), e, e.__traceback__))
         send_crash_notification(error_info)
         raise e
+�
