@@ -33,6 +33,7 @@ PLATEAU_PATIENCE = 10
 EARLY_STOPPING_PATIENCE = 25 
 CHECKPOINT_FILE = "patch_checkpoint.pth"
 BEST_CHECKPOINT_FILE = "best_patch_checkpoint.pth"
+CACHE_FILE = "preprocessed_dataset.pth"
 
 # --- ANSI Color Codes for Rich CLI Output ---
 class bcolors:
@@ -49,10 +50,26 @@ class bcolors:
 # --- Dataset Classes ---
 class VisDroneDataset(Dataset):
     """
-    Loads and pre-processes the entire VisDrone dataset into tensors in RAM 
-    to eliminate data loading bottlenecks during training.
+    Loads and pre-processes the entire VisDrone dataset into tensors.
+    If a cached version of the processed dataset exists, it loads it directly to save time.
+    Otherwise, it processes the data and creates a cache for future runs.
     """
     def __init__(self, root_dir, transform=None):
+        cache_path = os.path.join(root_dir, CACHE_FILE)
+
+        if os.path.exists(cache_path):
+            print(f"⏳ {bcolors.OKBLUE}Loading pre-processed dataset from cache: {cache_path}{bcolors.ENDC}")
+            try:
+                cached_data = torch.load(cache_path)
+                self.images = cached_data['images']
+                self.annotations = cached_data['annotations']
+                print(f"✅ {bcolors.OKGREEN}Cached dataset loaded successfully. {len(self.images)} items in memory.{bcolors.ENDC}")
+                return
+            except Exception as e:
+                print(f"⚠️ {bcolors.WARNING}Could not load cache file: {e}. Re-processing dataset.{bcolors.ENDC}")
+
+        # If cache doesn't exist or fails to load, process the dataset from scratch.
+        print(f"⏳ {bcolors.HEADER}No cache found. Pre-processing dataset into tensors... This may take a moment.{bcolors.ENDC}")
         self.images = []
         self.annotations = []
 
@@ -60,8 +77,6 @@ class VisDroneDataset(Dataset):
         annotation_dir = os.path.join(root_dir, 'annotations_v11')
         image_files = sorted(os.listdir(image_dir))
 
-        print(f"⏳ {bcolors.HEADER}Pre-processing dataset into tensors... This may take a moment.{bcolors.ENDC}")
-        
         for img_name in tqdm(image_files, desc="Processing Data"):
             img_path = os.path.join(image_dir, img_name)
             try:
@@ -72,7 +87,6 @@ class VisDroneDataset(Dataset):
                         self.images.append(transform(img_rgb))
                     else:
                         self.images.append(TF.to_tensor(img_rgb))
-
             except Exception as e:
                 print(f"Warning: Could not load image {img_path}. Skipping. Error: {e}")
                 continue
@@ -100,7 +114,12 @@ class VisDroneDataset(Dataset):
             
             self.annotations.append(boxes_tensor)
         
-        print(f"✅ {bcolors.OKGREEN}Dataset pre-processed successfully. {len(self.images)} tensors in memory.{bcolors.ENDC}")
+        print(f"💾 {bcolors.OKBLUE}Saving pre-processed dataset to cache for future runs...{bcolors.ENDC}")
+        try:
+            torch.save({'images': self.images, 'annotations': self.annotations}, cache_path)
+            print(f"✅ {bcolors.OKGREEN}Dataset cached successfully at: {cache_path}{bcolors.ENDC}")
+        except Exception as e:
+            print(f"⚠️ {bcolors.FAIL}Could not save cache file: {e}{bcolors.ENDC}")
 
     def __len__(self):
         return len(self.images)
@@ -224,7 +243,6 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
     transform = T.Compose([T.Resize((640, 640)), T.ToTensor()])
     dataset = VisDroneDataset(root_dir=DATASET_PATH, transform=transform)
     
-    # Restore num_workers as requested. With the pre-processed dataset and 'spawn' start method, this should be efficient.
     num_workers = min(os.cpu_count() // 2, 16) if os.cpu_count() else 4
     pin_memory = (device.type == 'cuda')
     
@@ -236,7 +254,7 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_fn)
 
-    print(f"\n� {bcolors.BOLD}Starting Adversarial Patch Training{bcolors.ENDC}")
+    print(f"\n🚀 {bcolors.BOLD}Starting Adversarial Patch Training{bcolors.ENDC}")
     print(f"   - Device: {bcolors.OKCYAN}{device.type.upper()}{bcolors.ENDC}")
     print(f"   - Batch Size: {bcolors.OKCYAN}{batch_size}{bcolors.ENDC}")
     print(f"   - Scaled LR: {bcolors.OKCYAN}{learning_rate:.2e}{bcolors.ENDC}")
@@ -354,12 +372,7 @@ def signal_handler(sig, frame):
 
 # --- Main execution block ---
 if __name__ == '__main__':
-    # FIX: Set the multiprocessing start method to 'spawn'. This creates clean child
-    # processes and is the most robust way to avoid hangs and CUDA initialization issues
-    # when using multiple workers for data loading.
     torch.multiprocessing.set_start_method('spawn', force=True)
-
-    # FIX: Register the signal handler to catch Ctrl+C (SIGINT)
     signal.signal(signal.SIGINT, signal_handler)
 
     parser = argparse.ArgumentParser(description="Train adversarial patches against a YOLO model with automatic LR scaling and early stopping.")
