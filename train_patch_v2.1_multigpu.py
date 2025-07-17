@@ -34,7 +34,7 @@ BASE_BATCH_SIZE = 8.0
 
 # --- Smart Training Config ---
 CHECKPOINT_FILE = "patch_checkpoint.pth"
-# ✅ NEW: Total Variation Loss weight to encourage patch smoothness
+# Total Variation Loss weight to encourage patch smoothness
 TV_LAMBDA = 2.5e-5
 
 # --- Early Stopping Configuration ---
@@ -151,11 +151,16 @@ class DummyWriter:
     def add_image(self, *args, **kwargs): pass
     def close(self): pass
 
-# --- ✅ NEW: Total Variation Loss Function ---
+# --- ✅ FIX: Corrected Total Variation Loss Function ---
 def total_variation_loss(patch):
-    """Calculates the Total Variation Loss for a patch to encourage smoothness."""
-    wh = patch[:, :, 1:, :] - patch[:, :, :-1, :]
-    ww = patch[:, :, :, 1:] - patch[:, :, :, :-1]
+    """
+    Calculates the Total Variation Loss for a 3D patch [C, H, W] to encourage smoothness.
+    This function is corrected to handle 3D tensors directly.
+    """
+    # Variation across height
+    wh = patch[:, 1:, :] - patch[:, :-1, :]
+    # Variation across width
+    ww = patch[:, :, 1:] - patch[:, :, :-1]
     return torch.sum(torch.abs(wh)) + torch.sum(torch.abs(ww))
 
 # --- Adversarial Patch Training (Now runs as a separate process) ---
@@ -260,7 +265,7 @@ def train_adversarial_patch(args_dict):
                 raw_preds = training_model.model(images)[0].transpose(1, 2)
                 # Adversarial loss to minimize the detector's confidence
                 adversarial_loss = torch.mean(torch.max(raw_preds[..., 4:], dim=-1)[0])
-                # ✅ NEW: TV loss to encourage patch smoothness
+                # TV loss to encourage patch smoothness
                 tv_loss = total_variation_loss(adversarial_patch)
                 # Combine losses
                 loss = adversarial_loss + TV_LAMBDA * tv_loss
@@ -293,7 +298,7 @@ def train_adversarial_patch(args_dict):
         try:
             print(f"GPU {gpu_id}: Starting evaluation for epoch {epoch}...")
             eval_model = YOLO(MODEL_NAME).to(device)
-            # ✅ FIX: Always evaluate on all images by setting num_eval_images to -1
+            # Always evaluate on all images by setting num_eval_images to -1
             success_rate = run_evaluation(
                 model=eval_model, 
                 patch_path=patch_filename, 
@@ -312,7 +317,6 @@ def train_adversarial_patch(args_dict):
 
         writer.add_scalar('Evaluation/SuccessRate', success_rate, epoch)
 
-        # ✅ OVERHAUL: Save the best patch based on ASR, not just the latest checkpoint
         if success_rate > best_success_rate:
             best_success_rate = success_rate
             epochs_no_improve = 0
