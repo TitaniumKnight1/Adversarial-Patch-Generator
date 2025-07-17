@@ -19,8 +19,8 @@ import multiprocessing as mp
 import time
 from queue import Empty
 
-# Import the evaluation logic from the user-provided file
-from evaluation_logic import run_evaluation
+# Import the optimized evaluation logic
+from evaluation_logic_optimized import run_evaluation
 
 # --- Configuration (Defaults) ---
 DATASET_PATH = 'VisDrone2019-DET-train'
@@ -168,7 +168,6 @@ def train_adversarial_patch(args_dict):
 
     gpu_id = args_dict['gpu_id']
     status_queue = args_dict['status_queue']
-    # ✅ NEW: Get the dedicated error queue from the arguments
     error_queue = args_dict['error_queue']
 
     try:
@@ -186,24 +185,28 @@ def train_adversarial_patch(args_dict):
         writer = SummaryWriter(log_dir=log_dir) if use_tensorboard else DummyWriter()
         
         training_model = YOLO(MODEL_NAME).to(device)
-        training_model.model.train()
 
-        if device.type == 'cuda' and not is_parallel:
-            try:
-                training_model.model = torch.compile(training_model.model)
-                print("✅ Model compiled successfully with torch.compile().")
-            except Exception: 
-                print("⚠️ torch.compile() failed. Running without compilation.")
+        # ✅ CRITICAL: Freeze all the weights of the model
+        print("Freezing model weights...")
+        for param in training_model.model.parameters():
+            param.requires_grad = False
+        print("Model weights frozen.")
+
+        # Set the model to evaluation mode. This is important for layers like BatchNorm.
+        # Gradients will still flow back to the input (the patch) because the optimizer is only tracking the patch.
+        training_model.model.eval()
 
         if starter_image_path and os.path.exists(starter_image_path):
             print(f"Initializing patch from starter image: {starter_image_path}")
             starter_image = Image.open(starter_image_path).convert("RGB")
             transform_starter = T.Compose([T.Resize((PATCH_RESOLUTION, PATCH_RESOLUTION)), T.ToTensor()])
             adversarial_patch = transform_starter(starter_image).to(device)
-            adversarial_patch.requires_grad_(True)
         else:
             print("Initializing patch with random noise.")
-            adversarial_patch = torch.rand((3, PATCH_RESOLUTION, PATCH_RESOLUTION), device=device, requires_grad=True)
+            adversarial_patch = torch.rand((3, PATCH_RESOLUTION, PATCH_RESOLUTION), device=device)
+        
+        # ✅ CRITICAL: Ensure the patch is the only tensor that requires gradients
+        adversarial_patch.requires_grad_(True)
 
         optimizer = torch.optim.Adam([adversarial_patch], lr=learning_rate)
         scaler = torch.amp.GradScaler(enabled=(device.type == 'cuda'))
@@ -281,7 +284,7 @@ def train_adversarial_patch(args_dict):
                     progress_bar.set_postfix(adv_loss=f"{total_epoch_loss/(i+1):.4f}")
                 
                 eta_str = "--:--:--"
-                if i > 0:
+                if i > 5:
                     elapsed_time = time.time() - epoch_start_time
                     batches_per_second = (i + 1) / elapsed_time
                     remaining_batches = len(dataloader) - (i + 1)
@@ -304,21 +307,26 @@ def train_adversarial_patch(args_dict):
             patch_image = T.ToPILImage()(adversarial_patch.cpu())
             patch_image.save(patch_filename)
             
-            status_queue.put({'gpu_id': gpu_id, 'status': 'Evaluating', 'epoch': epoch, 'progress': '0%', 'eta': '--:--:--'})
+            status_queue.put({'gpu_id': gpu_id, 'status': 'Evaluating', 'epoch': epoch, 'progress': 'N/A', 'eta': 'N/A'})
             
             print(f"GPU {gpu_id}: Starting evaluation for epoch {epoch}...")
-            eval_model = YOLO(MODEL_NAME).to(device)
-            success_rate = run_evaluation(
-                model=eval_model, 
-                patch_path=patch_filename, 
-                dataset_path=VALIDATION_DATASET_PATH, 
-                conf_threshold=EVAL_CONF_THRESHOLD, 
-                num_eval_images=-1, 
-                seed=42
-            )
+            success_rate = 0.0
+            try:
+                with torch.no_grad():
+                    success_rate = run_evaluation(
+                        model=training_model,
+                        patch_path=patch_filename, 
+                        dataset_path=VALIDATION_DATASET_PATH, 
+                        conf_threshold=EVAL_CONF_THRESHOLD, 
+                        num_eval_images=-1, 
+                        seed=42
+                    )
+            finally:
+                # This is not strictly necessary since we set it to eval mode once,
+                # but it's good practice in case other logic is added later.
+                training_model.model.eval()
+
             print(f"GPU {gpu_id}: Evaluation finished. Success rate: {success_rate:.2f}%")
-            del eval_model
-            torch.cuda.empty_cache()
 
             writer.add_scalar('Evaluation/SuccessRate', success_rate, epoch)
 
@@ -350,11 +358,10 @@ def train_adversarial_patch(args_dict):
         status_queue.put({'gpu_id': gpu_id, 'status': 'Finished', 'best_rate': f"{best_success_rate:.2f}%", 'epoch': epoch})
 
     except Exception as e:
-        print(f"💥💥💥 FATAL ERROR in GPU {gpu_id} Process 💥💥💥")
+        print(f"💥💥💥 FATAL ERROR in GPU {gpu_id} Process 💥💥�")
         error_info = "".join(traceback.format_exception(type(e), e, e.__traceback__))
         print(error_info)
         
-        # ✅ NEW: Put the full traceback into the dedicated error queue
         error_queue.put(f"--- ERROR ON GPU {gpu_id} ---\n{error_info}\n\n")
         
         status_queue.put({'gpu_id': gpu_id, 'status': 'Error'})
@@ -401,7 +408,6 @@ if __name__ == '__main__':
     os.makedirs(session_log_dir, exist_ok=True)
     
     processes = []
-    # ✅ NEW: Create the dedicated error queue
     error_queue = mp.Queue() if args.parallel and num_gpus > 1 else None
 
     try:
@@ -428,7 +434,6 @@ if __name__ == '__main__':
                     'resume_path': None, 'starter_image_path': args.starter_image, 
                     'status_queue': status_queue, 'is_parallel': True, 
                     'log_file': os.path.join(run_log_dir, 'output.log'),
-                    # ✅ NEW: Pass the error queue to the worker
                     'error_queue': error_queue
                 }
                 p = mp.Process(target=train_adversarial_patch, args=(process_args,))
@@ -483,7 +488,6 @@ if __name__ == '__main__':
             if not os.path.exists(DATASET_PATH): print(f"Error: Training dataset path not found: '{DATASET_PATH}'")
             elif not os.path.exists(VALIDATION_DATASET_PATH): print(f"Error: Validation dataset path not found: '{VALIDATION_DATASET_PATH}'")
             else:
-                # For single GPU, we can use a dummy queue that does nothing
                 dummy_queue = type('Queue', (), {'put': lambda self, x: None})()
                 train_args = {
                     'gpu_id': 0, 'batch_size': final_batch_size, 'learning_rate': final_learning_rate,
@@ -509,7 +513,6 @@ if __name__ == '__main__':
         send_crash_notification(error_info)
         raise e
     finally:
-        # ✅ NEW: After everything, check for errors and write the summary log
         if error_queue and not error_queue.empty():
             error_log_path = os.path.join(session_log_dir, "error_summary.log")
             print(f"\n\n💥 Errors were detected! Writing summary to: {error_log_path}")
@@ -521,3 +524,4 @@ if __name__ == '__main__':
                         break
             
     print("\n" + "="*60 + "\n✅ Training session completed.\n" + "="*60)
+�
