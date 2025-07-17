@@ -41,16 +41,24 @@ CHECKPOINT_FILE = "patch_checkpoint.pth"
 EVAL_PATIENCE = 10 
 EVAL_CONF_THRESHOLD = 0.25
 
+# --- ✅ NEW: Logging and Process Setup ---
+def setup_process_logging(log_file_path):
+    """Redirects stdout and stderr of a child process to a log file."""
+    sys.stdout = open(log_file_path, 'a', buffering=1)
+    sys.stderr = sys.stdout
+    # Also need to redirect the original stdout for tqdm to work with the main process monitor
+    tqdm.set_default_ também(file=sys.__stdout__)
+
+
 # --- Define collate_fn at the top level so it can be pickled ---
 def custom_collate_fn(batch):
     """
     Custom collate function to handle batches where some images might not have annotations.
     It filters out None items that might result from a failed __getitem__ call.
     """
-    # Filter out None entries in the batch
     batch = [b for b in batch if b is not None]
     if not batch:
-        return None, None # Return None if the whole batch is invalid
+        return None, None
     
     images, boxes = zip(*batch)
     return torch.stack(images, 0), boxes
@@ -71,8 +79,9 @@ class VisDroneDataset(Dataset):
         try:
             image = Image.open(img_path).convert("RGB")
         except (IOError, OSError):
+            # This print will go to the log file in parallel mode
             print(f"Warning: Could not read image {img_path}. Skipping.")
-            return None # Return None if image is corrupted
+            return None
 
         original_size = image.size
         boxes = []
@@ -101,15 +110,19 @@ class DummyDataset(Dataset):
     def __getitem__(self, idx): return torch.rand(3, 640, 640)
 
 # --- Autotune Function ---
-def autotune_batch_size(device_id, model_name, initial_batch_size=2):
-    """Finds the largest batch size that fits in a specific GPU's VRAM."""
-    device = torch.device(f"cuda:{device_id}")
-    model = YOLO(model_name).to(device)
+def autotune_batch_size(args_dict):
+    """Finds the largest batch size that fits in a specific GPU's VRAM. Designed to be run in a process."""
+    gpu_id = args_dict['gpu_id']
+    log_file = args_dict['log_file']
+    setup_process_logging(log_file) # Redirect output for this process
+
+    device = torch.device(f"cuda:{gpu_id}")
+    model = YOLO(MODEL_NAME).to(device)
     model.model.train()
     dataset = DummyDataset()
-    batch_size = initial_batch_size
+    batch_size = 2
     
-    print(f"🚀 Autotuning GPU {device_id} from batch size {batch_size}...")
+    print(f"🚀 Autotuning GPU {gpu_id} from batch size {batch_size}...")
     while True:
         try:
             dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -124,16 +137,16 @@ def autotune_batch_size(device_id, model_name, initial_batch_size=2):
                 raw_preds = model.model(images)[0].transpose(1, 2)
                 loss = torch.mean(torch.max(raw_preds[..., 4:], dim=-1)[0])
             loss.backward()
-            print(f"  - GPU {device_id}: Batch size {batch_size} fits.")
+            print(f"  - GPU {gpu_id}: Batch size {batch_size} fits.")
             del images, raw_preds, loss, dummy_patch
             batch_size *= 2
         except torch.cuda.OutOfMemoryError:
             max_size = batch_size // 2
-            print(f"  - ⚠️ GPU {device_id}: OOM at {batch_size}. Optimal: {max_size}.")
+            print(f"  - ⚠️ GPU {gpu_id}: OOM at {batch_size}. Optimal: {max_size}.")
             torch.cuda.empty_cache()
             return max_size
         except StopIteration:
-            print(f"  - ✅ GPU {device_id}: Batch size {batch_size} fits, but dataset is too small to double.")
+            print(f"  - ✅ GPU {gpu_id}: Batch size {batch_size} fits, but dataset is too small to double.")
             return batch_size
 
 # --- Dummy Writer for Headless Mode ---
@@ -145,6 +158,9 @@ class DummyWriter:
 # --- Adversarial Patch Training (Now runs as a separate process) ---
 def train_adversarial_patch(args_dict):
     """Main training function, designed to be run in a separate process."""
+    log_file = args_dict['log_file']
+    setup_process_logging(log_file)
+
     gpu_id = args_dict['gpu_id']
     batch_size = args_dict['batch_size']
     learning_rate = args_dict['learning_rate']
@@ -163,14 +179,12 @@ def train_adversarial_patch(args_dict):
     training_model = YOLO(MODEL_NAME).to(device)
     training_model.model.train()
 
-    # ✅ FIX: Only use torch.compile in single-GPU mode to avoid multiprocessing conflicts.
     if device.type == 'cuda' and not is_parallel:
         try:
             training_model.model = torch.compile(training_model.model)
             print("✅ Model compiled successfully with torch.compile().")
         except Exception: 
             print("⚠️ torch.compile() failed. Running without compilation.")
-
 
     if starter_image_path and os.path.exists(starter_image_path):
         starter_image = Image.open(starter_image_path).convert("RGB")
@@ -196,7 +210,7 @@ def train_adversarial_patch(args_dict):
         epoch += 1
         total_loss = 0
         
-        progress_bar = tqdm(dataloader, desc=f"GPU {gpu_id} | Epoch {epoch}", leave=False, position=gpu_id)
+        progress_bar = tqdm(dataloader, desc=f"GPU {gpu_id} | Epoch {epoch}", leave=False, position=gpu_id, file=sys.__stdout__)
 
         for i, (images, gt_boxes_batch) in enumerate(progress_bar):
             if images is None: continue
@@ -269,7 +283,7 @@ def train_adversarial_patch(args_dict):
             break
 
     writer.close()
-    return {'run_dir': log_dir, 'best_success_rate': best_success_rate, 'stopped_at_epoch': epoch}
+    status_queue.put({'gpu_id': gpu_id, 'status': 'finished', 'best_rate': f"{best_success_rate:.2f}%", 'epoch': epoch})
 
 # --- Crash Notification Function ---
 def send_crash_notification(error_message):
@@ -281,7 +295,6 @@ def send_crash_notification(error_message):
 if __name__ == '__main__':
     try:
         mp.set_start_method('spawn', force=True)
-        print("✅ Multiprocessing start method set to 'spawn'.")
     except RuntimeError:
         pass 
 
@@ -322,13 +335,14 @@ if __name__ == '__main__':
     if args.parallel and num_gpus > 1:
         batch_sizes = []
         if args.autotune:
+            autotune_args = [{'gpu_id': i, 'log_file': os.path.join(session_log_dir, f"autotune_gpu_{i}.log")} for i in range(num_gpus)]
             with mp.Pool(processes=num_gpus) as pool:
-                results = pool.starmap(autotune_batch_size, [(i, MODEL_NAME) for i in range(num_gpus)])
+                results = pool.map(autotune_batch_size, autotune_args)
                 batch_sizes = results
         else:
             batch_sizes = [args.batch_size] * num_gpus
 
-        processes, final_results = [], []
+        processes = []
         status_queue = mp.Queue()
         
         for i in range(num_gpus):
@@ -340,7 +354,7 @@ if __name__ == '__main__':
                 'log_dir': run_log_dir, 'num_eval_images': args.num_eval_images,
                 'use_tensorboard': (not args.no_tensorboard),
                 'starter_image_path': args.starter_image, 'status_queue': status_queue,
-                'is_parallel': True # Pass the flag to disable compile
+                'is_parallel': True, 'log_file': os.path.join(run_log_dir, 'output.log')
             }
             p = mp.Process(target=train_adversarial_patch, args=(process_args,))
             processes.append(p)
@@ -353,17 +367,18 @@ if __name__ == '__main__':
                 update = status_queue.get(timeout=1)
                 gpu_id = update['gpu_id']
                 statuses[gpu_id] = update
-                if statuses[gpu_id].get('status') == 'stopped':
+                if statuses[gpu_id].get('status') in ['stopped', 'finished']:
                     active_processes -= 1
+                
                 os.system('cls' if os.name == 'nt' else 'clear')
                 print(f"--- Live Parallel Training Status ({datetime.now().strftime('%H:%M:%S')}) ---")
-                print("{:<6} {:<8} {:<12} {:<12} {:<12} {:<12}".format("GPU", "Status", "Epoch", "Progress", "Adv Loss", "Best Rate"))
-                print("-" * 70)
+                print("{:<6} {:<10} {:<8} {:<12} {:<12} {:<12} {:<10}".format("GPU", "Status", "Epoch", "Progress", "Adv Loss", "Best Rate", "Patience"))
+                print("-" * 80)
                 for i in range(num_gpus):
-                    s = statuses[i]
-                    status = s.get('status', 'Running')
-                    print("{:<6} {:<8} {:<12} {:<12} {:<12} {:<12}".format(
-                        i, status.capitalize(), s.get('epoch', '-'), s.get('progress', '-'), s.get('loss', '-'), s.get('best_rate', '-')))
+                    s = statuses.get(i, {})
+                    status = s.get('status', 'Starting')
+                    print("{:<6} {:<10} {:<8} {:<12} {:<12} {:<12} {:<10}".format(
+                        i, status.capitalize(), s.get('epoch', '-'), s.get('progress', '-'), s.get('loss', '-'), s.get('best_rate', '-'), s.get('patience', '-')))
                 time.sleep(1)
             except:
                 if all(not p.is_alive() for p in processes): break
@@ -374,7 +389,8 @@ if __name__ == '__main__':
     else:
         final_batch_size = args.batch_size
         if args.autotune and device.type == 'cuda':
-            final_batch_size = autotune_batch_size(0, MODEL_NAME)
+            # Single GPU autotune doesn't need a separate process
+            final_batch_size = autotune_batch_size({'gpu_id': 0, 'log_file': os.path.join(session_log_dir, 'autotune.log')})
 
         final_learning_rate = (final_batch_size / BASE_BATCH_SIZE) * BASE_LR
         
@@ -388,7 +404,7 @@ if __name__ == '__main__':
                     'log_dir': session_log_dir, 'num_eval_images': args.num_eval_images,
                     'use_tensorboard': (not args.no_tensorboard), 'resume_path': args.resume,
                     'starter_image_path': args.starter_image, 'status_queue': dummy_queue,
-                    'is_parallel': False # Not parallel
+                    'is_parallel': False, 'log_file': os.path.join(session_log_dir, 'output.log')
                 }
                 train_adversarial_patch(train_args)
         except Exception as e:
