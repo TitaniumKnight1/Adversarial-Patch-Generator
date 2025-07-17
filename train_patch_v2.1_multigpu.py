@@ -41,13 +41,13 @@ CHECKPOINT_FILE = "patch_checkpoint.pth"
 EVAL_PATIENCE = 10 
 EVAL_CONF_THRESHOLD = 0.25
 
-# --- ✅ NEW: Logging and Process Setup ---
+# --- Logging and Process Setup ---
 def setup_process_logging(log_file_path):
     """Redirects stdout and stderr of a child process to a log file."""
     sys.stdout = open(log_file_path, 'a', buffering=1)
     sys.stderr = sys.stdout
-    # Also need to redirect the original stdout for tqdm to work with the main process monitor
-    tqdm.set_default_ também(file=sys.__stdout__)
+    # ✅ FIX: Corrected the typo in the function name
+    tqdm.set_default(file=sys.__stdout__)
 
 
 # --- Define collate_fn at the top level so it can be pickled ---
@@ -79,7 +79,6 @@ class VisDroneDataset(Dataset):
         try:
             image = Image.open(img_path).convert("RGB")
         except (IOError, OSError):
-            # This print will go to the log file in parallel mode
             print(f"Warning: Could not read image {img_path}. Skipping.")
             return None
 
@@ -342,7 +341,7 @@ if __name__ == '__main__':
         else:
             batch_sizes = [args.batch_size] * num_gpus
 
-        processes = []
+        processes, final_results = [], []
         status_queue = mp.Queue()
         
         for i in range(num_gpus):
@@ -389,7 +388,6 @@ if __name__ == '__main__':
     else:
         final_batch_size = args.batch_size
         if args.autotune and device.type == 'cuda':
-            # Single GPU autotune doesn't need a separate process
             final_batch_size = autotune_batch_size({'gpu_id': 0, 'log_file': os.path.join(session_log_dir, 'autotune.log')})
 
         final_learning_rate = (final_batch_size / BASE_BATCH_SIZE) * BASE_LR
