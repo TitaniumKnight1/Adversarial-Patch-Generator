@@ -6,6 +6,7 @@ import random
 import numpy as np
 from tqdm import tqdm
 from datetime import datetime
+import sys
 
 # --- This file contains the shared, definitive evaluation logic ---
 
@@ -58,25 +59,19 @@ def apply_patch_to_image_partial(image_pil, patch_pil, box):
 
     if box_w <= 0 or box_h <= 0: return patched_image
     
-    # Scale patch based on the smaller dimension of the box
     scale = random.uniform(0.4, 0.7)
     
-    # The patch will be a square
     patch_side_length = int(min(box_w, box_h) * scale)
     if patch_side_length == 0: return patched_image
     
-    # Resize the patch to be a square of the calculated side length
     resized_patch = patch_pil.resize((patch_side_length, patch_side_length), Image.LANCZOS)
     
-    # Calculate the center of the bounding box
     center_x = x1 + box_w / 2
     center_y = y1 + box_h / 2
 
-    # Calculate the top-left corner for a perfectly centered patch
     base_paste_x = center_x - (patch_side_length / 2)
     base_paste_y = center_y - (patch_side_length / 2)
 
-    # Add a random jitter, allowing the patch to move by up to 20% of its size from the center
     max_jitter = int(patch_side_length * 0.2)
     jitter_x = random.randint(-max_jitter, max_jitter)
     jitter_y = random.randint(-max_jitter, max_jitter)
@@ -84,7 +79,6 @@ def apply_patch_to_image_partial(image_pil, patch_pil, box):
     paste_x = int(base_paste_x + jitter_x)
     paste_y = int(base_paste_y + jitter_y)
     
-    # Clamp coordinates to ensure the patch stays within the image bounds
     paste_x = max(0, min(paste_x, img_w - patch_side_length))
     paste_y = max(0, min(paste_y, img_h - patch_side_length))
     
@@ -104,13 +98,14 @@ def draw_boxes(image_pil, boxes, color="lime", confidences=None):
                 text_bbox = draw.textbbox((x1, y1 - 12), label)
                 draw.rectangle(text_bbox, fill=color)
                 draw.text((x1, y1 - 12), label, fill="black")
-            except Exception: # Fallback for older versions
+            except Exception:
                 draw.text((x1, y1 - 5), label, fill=color)
 
-# ✅ OVERHAUL: Optimized evaluation function using batch processing
-def run_evaluation(model, patch_path, dataset_path, conf_threshold, num_eval_images, seed, visualize=False, visual_limit=10):
+# ✅ OVERHAUL: Function now accepts status_queue and gpu_id to report live progress
+def run_evaluation(model, patch_path, dataset_path, conf_threshold, num_eval_images, seed, 
+                   status_queue=None, gpu_id=None, visualize=False, visual_limit=10):
     """
-    The single, definitive evaluation function, optimized for speed using batch inference.
+    The single, definitive evaluation function, optimized for speed and live progress reporting.
     """
     if seed is not None:
         print(f"Running evaluation with fixed seed: {seed}")
@@ -144,21 +139,28 @@ def run_evaluation(model, patch_path, dataset_path, conf_threshold, num_eval_ima
 
     total_attacks, successful_attacks, saved_visuals_count = 0, 0, 0
     
-    # Use tqdm for the main loop to show progress on the evaluation itself
-    for idx in tqdm(eval_indices, desc="  Evaluating Patch", leave=False, file=sys.__stdout__):
+    # The internal tqdm is now disabled as progress is reported to the main table
+    for idx, _ in enumerate(tqdm(eval_indices, desc="  Evaluating Patch", leave=False, disable=True)):
         original_image_pil, gt_boxes, img_path = dataset[idx]
         
+        # ✅ NEW: Report progress to the main process via the status queue
+        if status_queue and (idx % 5 == 0 or idx == len(eval_indices) - 1):
+            progress_percent = (idx + 1) / len(eval_indices) * 100
+            status_queue.put({
+                'gpu_id': gpu_id,
+                'status': 'Evaluating',
+                'progress': f'{progress_percent:.1f}%'
+            })
+
         if not gt_boxes:
             continue
         
-        # INFERENCE 1: Run on the clean image to get the baseline detection count
         results_before_list = model(original_image_pil, conf=conf_threshold, verbose=False)
         num_boxes_before = len(results_before_list[0].boxes)
 
         if num_boxes_before == 0:
             continue
 
-        # BATCH PREPARATION: Create a batch of images, each with the patch applied over a different GT box
         patched_images_batch = [apply_patch_to_image_partial(original_image_pil, patch_pil, gt_box) for gt_box in gt_boxes]
 
         if not patched_images_batch:
@@ -166,10 +168,8 @@ def run_evaluation(model, patch_path, dataset_path, conf_threshold, num_eval_ima
 
         total_attacks += len(patched_images_batch)
 
-        # INFERENCE 2: Run on the entire batch of patched images
         results_after_list = model(patched_images_batch, conf=conf_threshold, verbose=False)
 
-        # PROCESS BATCH RESULTS: Compare each patched result to the original
         for i, results_after in enumerate(results_after_list):
             num_boxes_after = len(results_after.boxes)
             is_success = num_boxes_after < num_boxes_before
@@ -184,8 +184,7 @@ def run_evaluation(model, patch_path, dataset_path, conf_threshold, num_eval_ima
                 img_before_with_box = original_image_pil.copy()
                 draw_boxes(img_before_with_box, [gt_box_for_vis], color="red")
 
-                # The 'results_after.orig_img' is the patched image as a numpy array
-                img_after_with_detections = Image.fromarray(results_after.orig_img[:,:,::-1]) # BGR to RGB
+                img_after_with_detections = Image.fromarray(results_after.orig_img[:,:,::-1])
                 draw_boxes(img_after_with_detections, 
                            results_after.boxes.xyxy.cpu().numpy(), 
                            color="lime", 
