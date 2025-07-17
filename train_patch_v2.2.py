@@ -229,8 +229,13 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
 
     transform = T.Compose([T.Resize((640, 640)), T.ToTensor()])
     dataset = VisDroneDataset(root_dir=DATASET_PATH, transform=transform)
-    num_workers = min(os.cpu_count() // 2, 16) if os.cpu_count() else 4
+    
+    # FIX: Set num_workers to 0. When pre-loading the dataset to RAM,
+    # the overhead of multiprocessing can cause deadlocks and is often slower
+    # than loading from memory in the main thread. This resolves the hang at the start of an epoch.
+    num_workers = 0
     pin_memory = (device.type == 'cuda')
+    
     def collate_fn(batch):
         images = [item[0] for item in batch if item is not None]
         boxes = [item[1] for item in batch if item is not None]
@@ -243,7 +248,7 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
     print(f"   - Device: {bcolors.OKCYAN}{device.type.upper()}{bcolors.ENDC}")
     print(f"   - Batch Size: {bcolors.OKCYAN}{batch_size}{bcolors.ENDC}")
     print(f"   - Scaled LR: {bcolors.OKCYAN}{learning_rate:.2e}{bcolors.ENDC}")
-    print(f"   - DataLoaders: {bcolors.OKCYAN}{num_workers}{bcolors.ENDC}")
+    print(f"   - DataLoaders: {bcolors.OKCYAN}{num_workers} (0 is optimal for pre-loaded data){bcolors.ENDC}")
     print(f"   - TV Weight: {bcolors.OKCYAN}{tv_weight}{bcolors.ENDC}")
     print(f"   - Early Stopping Patience: {bcolors.OKCYAN}{EARLY_STOPPING_PATIENCE}{bcolors.ENDC}")
 
@@ -385,7 +390,6 @@ if __name__ == '__main__':
     elif device.type == 'cuda':
         print(f"🛠️ {bcolors.HEADER}Preparing for autotune...{bcolors.ENDC}")
         temp_model = YOLO(MODEL_NAME).to(device)
-        # FIX: Only wrap in DataParallel if multiple GPUs are explicitly requested
         if args.gpu_ids and len(args.gpu_ids) > 1:
             temp_model.model = torch.nn.DataParallel(temp_model.model)
         temp_model.model.train()
@@ -393,7 +397,7 @@ if __name__ == '__main__':
         final_batch_size = autotune_batch_size(
             device=device, 
             model=temp_model, 
-            dataset=DummyDataset() # The dataset is only used for its length now
+            dataset=DummyDataset() 
         )
         del temp_model
         torch.cuda.empty_cache()
@@ -401,7 +405,6 @@ if __name__ == '__main__':
         print("Autotune is only for CUDA. Using base batch size.")
         final_batch_size = BASE_BATCH_SIZE
 
-    # Scale learning rate based on the effective batch size (total across all GPUs)
     num_gpus = len(args.gpu_ids) if args.gpu_ids else 1
     effective_batch_size = final_batch_size * num_gpus
     scaled_lr = BASE_LEARNING_RATE * (effective_batch_size / BASE_BATCH_SIZE)
