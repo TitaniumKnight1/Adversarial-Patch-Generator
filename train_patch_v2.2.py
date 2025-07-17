@@ -19,6 +19,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from datetime import datetime
 import math
 import signal # Import the signal module for Ctrl+C handling
+import torch.multiprocessing # Import for sharing strategy
 
 # --- Configuration (Defaults) ---
 DATASET_PATH = 'VisDrone2019-DET-train'
@@ -68,7 +69,6 @@ class VisDroneDataset(Dataset):
             except Exception as e:
                 print(f"⚠️ {bcolors.WARNING}Could not load cache file: {e}. Re-processing dataset.{bcolors.ENDC}")
 
-        # If cache doesn't exist or fails to load, process the dataset from scratch.
         print(f"⏳ {bcolors.HEADER}No cache found. Pre-processing dataset into tensors... This may take a moment.{bcolors.ENDC}")
         self.images = []
         self.annotations = []
@@ -372,6 +372,11 @@ def signal_handler(sig, frame):
 
 # --- Main execution block ---
 if __name__ == '__main__':
+    # FIX: Set the sharing strategy to 'file_system'. This is crucial for systems
+    # with low file descriptor limits, as it prevents the "Too many open files"
+    # error when using multiple DataLoader workers with a large, pre-loaded dataset.
+    torch.multiprocessing.set_sharing_strategy('file_system')
+    
     torch.multiprocessing.set_start_method('spawn', force=True)
     signal.signal(signal.SIGINT, signal_handler)
 
