@@ -151,15 +151,12 @@ class DummyWriter:
     def add_image(self, *args, **kwargs): pass
     def close(self): pass
 
-# --- ✅ FIX: Corrected Total Variation Loss Function ---
+# --- Total Variation Loss Function ---
 def total_variation_loss(patch):
     """
     Calculates the Total Variation Loss for a 3D patch [C, H, W] to encourage smoothness.
-    This function is corrected to handle 3D tensors directly.
     """
-    # Variation across height
     wh = patch[:, 1:, :] - patch[:, :-1, :]
-    # Variation across width
     ww = patch[:, :, 1:] - patch[:, :, :-1]
     return torch.sum(torch.abs(wh)) + torch.sum(torch.abs(ww))
 
@@ -231,6 +228,9 @@ def train_adversarial_patch(args_dict):
         total_epoch_loss = 0
         
         progress_bar = tqdm(dataloader, desc=f"GPU {gpu_id} | Epoch {epoch}", leave=False, disable=is_parallel, file=sys.__stdout__)
+        
+        # ✅ NEW: Timing for ETA calculation
+        epoch_start_time = time.time()
 
         for i, (images, gt_boxes_batch) in enumerate(progress_bar):
             if images is None: continue
@@ -263,11 +263,8 @@ def train_adversarial_patch(args_dict):
 
             with torch.amp.autocast(device.type):
                 raw_preds = training_model.model(images)[0].transpose(1, 2)
-                # Adversarial loss to minimize the detector's confidence
                 adversarial_loss = torch.mean(torch.max(raw_preds[..., 4:], dim=-1)[0])
-                # TV loss to encourage patch smoothness
                 tv_loss = total_variation_loss(adversarial_patch)
-                # Combine losses
                 loss = adversarial_loss + TV_LAMBDA * tv_loss
             
             scaler.scale(loss).backward()
@@ -280,11 +277,21 @@ def train_adversarial_patch(args_dict):
             if not is_parallel:
                 progress_bar.set_postfix(adv_loss=f"{total_epoch_loss/(i+1):.4f}")
             
+            # ✅ NEW: Calculate and format ETA string
+            eta_str = "--:--:--"
+            if i > 0:
+                elapsed_time = time.time() - epoch_start_time
+                batches_per_second = (i + 1) / elapsed_time
+                remaining_batches = len(dataloader) - (i + 1)
+                eta_seconds = remaining_batches / batches_per_second if batches_per_second > 0 else 0
+                eta_str = time.strftime('%H:%M:%S', time.gmtime(eta_seconds))
+
             if i % 10 == 0 or i == len(dataloader) - 1:
                 status_queue.put({
                     'gpu_id': gpu_id, 'epoch': epoch, 'progress': f"{i+1}/{len(dataloader)}", 
                     'loss': f"{total_epoch_loss/(i+1):.4f}", 'best_rate': f"{best_success_rate:.2f}%", 
-                    'patience': f"{epochs_no_improve}/{EVAL_PATIENCE}", 'status': 'running'
+                    'patience': f"{epochs_no_improve}/{EVAL_PATIENCE}", 'status': 'Running',
+                    'eta': eta_str # Add ETA to the status update
                 })
 
         avg_loss = total_epoch_loss / len(dataloader)
@@ -295,10 +302,12 @@ def train_adversarial_patch(args_dict):
         patch_image = T.ToPILImage()(adversarial_patch.cpu())
         patch_image.save(patch_filename)
         
+        # ✅ NEW: Send "Evaluating" status before starting evaluation
+        status_queue.put({'gpu_id': gpu_id, 'status': 'Evaluating', 'epoch': epoch, 'progress': '0%'})
+        
         try:
             print(f"GPU {gpu_id}: Starting evaluation for epoch {epoch}...")
             eval_model = YOLO(MODEL_NAME).to(device)
-            # Always evaluate on all images by setting num_eval_images to -1
             success_rate = run_evaluation(
                 model=eval_model, 
                 patch_path=patch_filename, 
@@ -322,12 +331,10 @@ def train_adversarial_patch(args_dict):
             epochs_no_improve = 0
             print(f"GPU {gpu_id}: ✅ New best success rate: {best_success_rate:.2f}%. Saving best patch.")
             
-            # Save the best patch image separately for easy access
             best_patch_filename = os.path.join(log_dir, "best_patch.png")
             best_patch_image = T.ToPILImage()(adversarial_patch.cpu())
             best_patch_image.save(best_patch_filename)
             
-            # Also save the full checkpoint
             checkpoint = {
                 'epoch': epoch, 'patch_state_dict': adversarial_patch.data.clone(), 
                 'optimizer_state_dict': optimizer.state_dict(), 'scaler_state_dict': scaler.state_dict(), 
@@ -340,11 +347,11 @@ def train_adversarial_patch(args_dict):
         
         if epochs_no_improve >= EVAL_PATIENCE:
             print(f"GPU {gpu_id}: Early stopping triggered after {EVAL_PATIENCE} epochs with no improvement.")
-            status_queue.put({'gpu_id': gpu_id, 'status': 'stopped', 'best_rate': f"{best_success_rate:.2f}%", 'epoch': epoch})
+            status_queue.put({'gpu_id': gpu_id, 'status': 'Stopped', 'best_rate': f"{best_success_rate:.2f}%", 'epoch': epoch})
             break
 
     writer.close()
-    status_queue.put({'gpu_id': gpu_id, 'status': 'finished', 'best_rate': f"{best_success_rate:.2f}%", 'epoch': epoch})
+    status_queue.put({'gpu_id': gpu_id, 'status': 'Finished', 'best_rate': f"{best_success_rate:.2f}%", 'epoch': epoch})
 
 # --- Crash Notification Function ---
 def send_crash_notification(error_message):
@@ -418,33 +425,45 @@ if __name__ == '__main__':
                 p.start()
 
             statuses = {i: {} for i in range(num_gpus)}
-            active_processes = num_gpus
             
-            header = "{:<6} {:<10} {:<8} {:<12} {:<12} {:<12} {:<10}".format("GPU", "Status", "Epoch", "Progress", "Adv Loss", "Best Rate", "Patience")
+            # ✅ OVERHAUL: New header with ETA column
+            header = "{:<6} {:<12} {:<8} {:<12} {:<12} {:<12} {:<10} {:<10}".format(
+                "GPU", "Status", "Epoch", "Progress", "Adv Loss", "Best Rate", "Patience", "ETA"
+            )
             print(f"--- Live Parallel Training Status ---")
             print(header)
             print("-" * len(header))
             print("\n" * num_gpus, end="")
 
-            while active_processes > 0:
-                try:
-                    update = status_queue.get(timeout=1)
-                    gpu_id = update['gpu_id']
-                    statuses[gpu_id] = update
-                    if statuses[gpu_id].get('status') in ['stopped', 'finished', 'error']:
-                        active_processes -= 1
-                    
-                    print(f"\033[{num_gpus}A", end="")
-                    for i in range(num_gpus):
-                        s = statuses.get(i, {})
-                        status = s.get('status', 'Starting...')
-                        line = "{:<6} {:<10} {:<8} {:<12} {:<12} {:<12} {:<10}".format(
-                            i, status.capitalize(), s.get('epoch', '-'), s.get('progress', '-'), 
-                            s.get('loss', '-'), s.get('best_rate', '-'), s.get('patience', '-'))
-                        print(line + "\033[K")
-                    
-                except Empty:
-                    if all(not p.is_alive() for p in processes): break
+            # ✅ OVERHAUL: New stable monitoring loop
+            active_gpus = num_gpus
+            while active_gpus > 0:
+                # 1. Drain the queue of all recent updates
+                while not status_queue.empty():
+                    try:
+                        update = status_queue.get_nowait()
+                        gpu_id = update['gpu_id']
+                        statuses[gpu_id] = update # Overwrite with the latest status
+                    except Empty:
+                        break
+                
+                # 2. Redraw the entire status block
+                print(f"\033[{num_gpus}A", end="") # Move cursor up
+                for i in range(num_gpus):
+                    s = statuses.get(i, {})
+                    status = s.get('status', 'Starting...')
+                    line = "{:<6} {:<12} {:<8} {:<12} {:<12} {:<12} {:<10} {:<10}".format(
+                        i, status.capitalize(), s.get('epoch', '-'), s.get('progress', '-'), 
+                        s.get('loss', '-'), s.get('best_rate', '-'), s.get('patience', '-'),
+                        s.get('eta', '--:--:--')
+                    )
+                    print(line + "\033[K") # \033[K clears the rest of the line
+                
+                # 3. Check for finished processes
+                active_gpus = sum(1 for p in processes if p.is_alive())
+
+                # 4. Sleep for the refresh interval
+                time.sleep(0.5)
             
             for p in processes: p.join()
 
