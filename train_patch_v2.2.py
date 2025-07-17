@@ -48,10 +48,10 @@ class bcolors:
 # --- Dataset Classes ---
 class VisDroneDataset(Dataset):
     """
-    Loads the entire VisDrone dataset into RAM to eliminate disk I/O bottlenecks during training.
+    Loads and pre-processes the entire VisDrone dataset into tensors in RAM 
+    to eliminate data loading bottlenecks during training.
     """
     def __init__(self, root_dir, transform=None):
-        self.transform = transform
         self.images = []
         self.annotations = []
 
@@ -59,17 +59,25 @@ class VisDroneDataset(Dataset):
         annotation_dir = os.path.join(root_dir, 'annotations_v11')
         image_files = sorted(os.listdir(image_dir))
 
-        print(f"⏳ {bcolors.HEADER}Pre-loading dataset into RAM... This may take a moment.{bcolors.ENDC}")
+        print(f"⏳ {bcolors.HEADER}Pre-processing dataset into tensors... This may take a moment.{bcolors.ENDC}")
         
-        for img_name in tqdm(image_files, desc="Loading Data"):
+        for img_name in tqdm(image_files, desc="Processing Data"):
             img_path = os.path.join(image_dir, img_name)
             try:
                 with Image.open(img_path) as img:
-                    self.images.append(img.convert("RGB"))
+                    img_rgb = img.convert("RGB")
+                    original_size = img_rgb.size
+                    # Apply transformations and store the final tensor
+                    if transform:
+                        self.images.append(transform(img_rgb))
+                    else:
+                        self.images.append(TF.to_tensor(img_rgb))
+
             except Exception as e:
                 print(f"Warning: Could not load image {img_path}. Skipping. Error: {e}")
                 continue
 
+            # Load, scale, and store the final annotation tensor
             boxes = []
             annotation_name = os.path.splitext(img_name)[0] + '.txt'
             annotation_path = os.path.join(annotation_dir, annotation_name)
@@ -85,29 +93,22 @@ class VisDroneDataset(Dataset):
                         except (ValueError, IndexError):
                             continue
             
-            self.annotations.append(torch.tensor(boxes, dtype=torch.float32))
+            boxes_tensor = torch.tensor(boxes, dtype=torch.float32)
+            if boxes_tensor.nelement() > 0:
+                scale_x, scale_y = 640 / original_size[0], 640 / original_size[1]
+                boxes_tensor[:, [0, 2]] *= scale_x
+                boxes_tensor[:, [1, 3]] *= scale_y
+            
+            self.annotations.append(boxes_tensor)
         
-        print(f"✅ {bcolors.OKGREEN}Dataset pre-loaded successfully. {len(self.images)} images in memory.{bcolors.ENDC}")
+        print(f"✅ {bcolors.OKGREEN}Dataset pre-processed successfully. {len(self.images)} tensors in memory.{bcolors.ENDC}")
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx):
-        image = self.images[idx]
-        boxes = self.annotations[idx]
-        original_size = image.size
-
-        if self.transform:
-            image = self.transform(image)
-        
-        if boxes.nelement() > 0:
-            scale_x, scale_y = 640 / original_size[0], 640 / original_size[1]
-            scaled_boxes = boxes.clone()
-            scaled_boxes[:, [0, 2]] *= scale_x
-            scaled_boxes[:, [1, 3]] *= scale_y
-            return image, scaled_boxes
-
-        return image, boxes
+        # Fetch the pre-processed tensors directly. This is extremely fast.
+        return self.images[idx], self.annotations[idx]
 
 class DummyDataset(Dataset):
     """A simple dummy dataset for the autotune memory test that returns tensors of a specific size."""
@@ -225,7 +226,7 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
     transform = T.Compose([T.Resize((640, 640)), T.ToTensor()])
     dataset = VisDroneDataset(root_dir=DATASET_PATH, transform=transform)
     
-    # Reverting num_workers to diagnose the bottleneck with multiprocessing enabled.
+    # Restore num_workers as requested. With the pre-processed dataset, this should now be efficient.
     num_workers = min(os.cpu_count() // 2, 16) if os.cpu_count() else 4
     pin_memory = (device.type == 'cuda')
     
@@ -254,20 +255,12 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
         
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{max_epochs}", ncols=120)
         
-        loop_start_time = time.time()
         for i, (images, gt_boxes_batch) in enumerate(progress_bar):
-            # --- DEBUG: Pinpoint data loading bottleneck ---
-            print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] DEBUG: Iter {i+1} - Dataloader fetch took: {time.time() - loop_start_time:.4f}s")
-            
             if images is None: 
-                loop_start_time = time.time()
                 continue
             
-            step_start_time = time.time()
             images = images.to(device, non_blocking=pin_memory)
-            print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] DEBUG: Iter {i+1} - Data to device took: {time.time() - step_start_time:.4f}s")
             
-            step_start_time = time.time()
             angle, scale = random.uniform(-15, 15), random.uniform(0.8, 1.2)
             transformed_patch = TF.rotate(adversarial_patch, angle)
             transformed_patch = TF.resize(transformed_patch, (int(PATCH_SIZE * scale), int(PATCH_SIZE * scale)))
@@ -287,26 +280,18 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
                 else:
                     x_start, y_start = random.randint(0, 640 - PATCH_SIZE), random.randint(0, 640 - PATCH_SIZE)
                     images[img_idx, :, y_start:y_start+PATCH_SIZE, x_start:x_start+PATCH_SIZE] = transformed_patch
-            print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] DEBUG: Iter {i+1} - Patch transform & apply took: {time.time() - step_start_time:.4f}s")
 
-            step_start_time = time.time()
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device.type):
                 raw_preds = model.model(images)[0].transpose(1, 2)
                 adv_loss = -torch.mean(torch.max(raw_preds[..., 4:], dim=-1)[0])
                 tv_loss = total_variation(adversarial_patch)
                 total_loss = adv_loss + tv_weight * tv_loss
-            print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] DEBUG: Iter {i+1} - Forward pass took: {time.time() - step_start_time:.4f}s")
 
-            step_start_time = time.time()
             scaler.scale(total_loss).backward()
-            print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] DEBUG: Iter {i+1} - Backward pass took: {time.time() - step_start_time:.4f}s")
-
-            step_start_time = time.time()
             scaler.step(optimizer)
             scaler.update()
             adversarial_patch.data.clamp_(0, 1)
-            print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] DEBUG: Iter {i+1} - Optimizer step took: {time.time() - step_start_time:.4f}s")
             
             total_adv_loss += adv_loss.item()
             total_tv_loss += tv_loss.item()
@@ -317,8 +302,6 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
                 lr=f"{current_lr:.1e}",
                 best_loss=f"{best_loss:.4f}"
             )
-            # --- DEBUG: Mark start time for next dataloader fetch ---
-            loop_start_time = time.time()
 
         avg_adv_loss = total_adv_loss / len(dataloader) if len(dataloader) > 0 else 0
         avg_tv_loss = total_tv_loss / len(dataloader) if len(dataloader) > 0 else 0
