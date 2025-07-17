@@ -46,9 +46,7 @@ def setup_process_logging(log_file_path):
     """Redirects stdout and stderr of a child process to a log file."""
     sys.stdout = open(log_file_path, 'a', buffering=1)
     sys.stderr = sys.stdout
-    # ✅ FIX: Corrected the typo in the function name
-    tqdm.set_default(file=sys.__stdout__)
-
+    # The tqdm progress bar instance itself will be directed to the correct output stream.
 
 # --- Define collate_fn at the top level so it can be pickled ---
 def custom_collate_fn(batch):
