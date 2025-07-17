@@ -430,4 +430,3 @@ if __name__ == '__main__':
         error_info = "".join(traceback.format_exception(type(e), e, e.__traceback__))
         send_crash_notification(error_info)
         raise e
-�
