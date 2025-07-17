@@ -19,7 +19,6 @@ import multiprocessing as mp
 import time
 from queue import Empty
 
-# ✅ FIX: Changed import back to the correct module name
 from evaluation_logic import run_evaluation
 
 # --- Configuration (Defaults) ---
@@ -250,7 +249,15 @@ def train_adversarial_patch(args_dict):
                         scale = random.uniform(0.4, 0.7)
                         patch_side_length = int(base_size * scale)
                         if patch_side_length == 0: continue
-                        resized_patch = TF.resize(adversarial_patch, [patch_side_length, patch_side_length], antialias=True)
+                        
+                        # ✅ FIX: Perform resize on CPU to avoid CUDA shared memory error
+                        # This is a safe workaround for the hardware-specific CUDA kernel limitation.
+                        resized_patch = TF.resize(
+                            adversarial_patch.cpu(), 
+                            [patch_side_length, patch_side_length], 
+                            antialias=True
+                        ).to(device)
+
                         center_x, center_y = x1 + box_w / 2, y1 + box_h / 2
                         base_paste_x, base_paste_y = center_x - (patch_side_length / 2), center_y - (patch_side_length / 2)
                         max_jitter = int(patch_side_length * 0.2)
@@ -260,8 +267,9 @@ def train_adversarial_patch(args_dict):
                         paste_y = max(0, min(paste_y, images.shape[2] - patch_side_length))
                         images[img_idx, :, paste_y:paste_y+patch_side_length, paste_x:paste_x+patch_side_length] = resized_patch
                     else:
-                        x_start, y_start = random.randint(0, 640 - 100), random.randint(0, 640 - 100)
-                        images[img_idx, :, y_start:y_start+100, x_start:x_start+100] = TF.resize(adversarial_patch, [100, 100], antialias=True)
+                        # If no GT box, apply the patch at its native resolution
+                        x_start, y_start = random.randint(0, 640 - PATCH_RESOLUTION), random.randint(0, 640 - PATCH_RESOLUTION)
+                        images[img_idx, :, y_start:y_start+PATCH_RESOLUTION, x_start:x_start+PATCH_RESOLUTION] = adversarial_patch
 
                 with torch.amp.autocast(device.type):
                     raw_preds = training_model.model(images)[0].transpose(1, 2)
