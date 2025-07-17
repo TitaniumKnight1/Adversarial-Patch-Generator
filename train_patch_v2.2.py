@@ -49,9 +49,6 @@ class bcolors:
     UNDERLINE = '\033[4m'
 
 # --- Top-level Functions ---
-
-# FIX: Moved collate_fn to the top level. This makes it pickle-able by multiprocessing
-# workers, resolving the AttributeError.
 def collate_fn(batch):
     """Custom collate function to handle batches with potentially empty data."""
     images = [item[0] for item in batch if item is not None]
@@ -226,7 +223,7 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
             print(f"⚠️ {bcolors.WARNING}torch.compile() failed: {e}. Running without compilation.{bcolors.ENDC}")
 
     if starter_image_path and os.path.exists(starter_image_path):
-        print(f"� {bcolors.OKCYAN}Initializing patch from starter image: {starter_image_path}{bcolors.ENDC}")
+        print(f"🌱 {bcolors.OKCYAN}Initializing patch from starter image: {starter_image_path}{bcolors.ENDC}")
         starter_image = Image.open(starter_image_path).convert("RGB")
         transform_starter = T.Compose([T.Resize((PATCH_SIZE, PATCH_SIZE)), T.ToTensor()])
         adversarial_patch = transform_starter(starter_image).to(device)
@@ -257,7 +254,12 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
     num_workers = min(os.cpu_count() // 2, 16) if os.cpu_count() else 4
     pin_memory = (device.type == 'cuda')
     
+    # --- DEBUG: Time the DataLoader creation ---
+    print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] DEBUG: Creating DataLoader with {num_workers} workers...")
+    dataloader_start_time = time.time()
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_fn)
+    print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] DEBUG: DataLoader created. Took: {time.time() - dataloader_start_time:.4f}s")
+
 
     print(f"\n🚀 {bcolors.BOLD}Starting Adversarial Patch Training{bcolors.ENDC}")
     print(f"   - Device: {bcolors.OKCYAN}{device.type.upper()}{bcolors.ENDC}")
@@ -276,7 +278,14 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
         
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{max_epochs}", ncols=120)
         
+        # --- DEBUG: Time the fetch of the very first batch ---
+        print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] DEBUG: Starting epoch {epoch+1}, beginning training loop...")
+        first_batch_fetch_start = time.time()
+        
         for i, (images, gt_boxes_batch) in enumerate(progress_bar):
+            if i == 0:
+                print(f"\n[{datetime.now().strftime('%H:%M:%S.%f')}] DEBUG: First batch fetched for epoch {epoch+1}. Took: {time.time() - first_batch_fetch_start:.4f}s")
+
             if images is None: 
                 continue
             
