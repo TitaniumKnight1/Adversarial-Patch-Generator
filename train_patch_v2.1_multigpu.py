@@ -186,14 +186,11 @@ def train_adversarial_patch(args_dict):
         
         training_model = YOLO(MODEL_NAME).to(device)
 
-        # ✅ CRITICAL: Freeze all the weights of the model
         print("Freezing model weights...")
         for param in training_model.model.parameters():
             param.requires_grad = False
         print("Model weights frozen.")
 
-        # Set the model to evaluation mode. This is important for layers like BatchNorm.
-        # Gradients will still flow back to the input (the patch) because the optimizer is only tracking the patch.
         training_model.model.eval()
 
         if starter_image_path and os.path.exists(starter_image_path):
@@ -205,7 +202,6 @@ def train_adversarial_patch(args_dict):
             print("Initializing patch with random noise.")
             adversarial_patch = torch.rand((3, PATCH_RESOLUTION, PATCH_RESOLUTION), device=device)
         
-        # ✅ CRITICAL: Ensure the patch is the only tensor that requires gradients
         adversarial_patch.requires_grad_(True)
 
         optimizer = torch.optim.Adam([adversarial_patch], lr=learning_rate)
@@ -307,23 +303,24 @@ def train_adversarial_patch(args_dict):
             patch_image = T.ToPILImage()(adversarial_patch.cpu())
             patch_image.save(patch_filename)
             
-            status_queue.put({'gpu_id': gpu_id, 'status': 'Evaluating', 'epoch': epoch, 'progress': 'N/A', 'eta': 'N/A'})
+            status_queue.put({'gpu_id': gpu_id, 'status': 'Evaluating', 'epoch': epoch, 'progress': '0.0%', 'eta': 'N/A', 'loss': 'N/A'})
             
             print(f"GPU {gpu_id}: Starting evaluation for epoch {epoch}...")
             success_rate = 0.0
             try:
                 with torch.no_grad():
+                    # ✅ NEW: Pass the status_queue and gpu_id for live progress reporting
                     success_rate = run_evaluation(
                         model=training_model,
                         patch_path=patch_filename, 
                         dataset_path=VALIDATION_DATASET_PATH, 
                         conf_threshold=EVAL_CONF_THRESHOLD, 
                         num_eval_images=-1, 
-                        seed=42
+                        seed=42,
+                        status_queue=status_queue,
+                        gpu_id=gpu_id
                     )
             finally:
-                # This is not strictly necessary since we set it to eval mode once,
-                # but it's good practice in case other logic is added later.
                 training_model.model.eval()
 
             print(f"GPU {gpu_id}: Evaluation finished. Success rate: {success_rate:.2f}%")
@@ -358,7 +355,7 @@ def train_adversarial_patch(args_dict):
         status_queue.put({'gpu_id': gpu_id, 'status': 'Finished', 'best_rate': f"{best_success_rate:.2f}%", 'epoch': epoch})
 
     except Exception as e:
-        print(f"💥💥💥 FATAL ERROR in GPU {gpu_id} Process 💥💥�")
+        print(f"💥💥💥 FATAL ERROR in GPU {gpu_id} Process 💥💥💥")
         error_info = "".join(traceback.format_exception(type(e), e, e.__traceback__))
         print(error_info)
         
@@ -456,7 +453,11 @@ if __name__ == '__main__':
                     try:
                         update = status_queue.get_nowait()
                         gpu_id = update['gpu_id']
-                        statuses[gpu_id] = update
+                        # Only update the fields that are present in the update
+                        if gpu_id in statuses:
+                            statuses[gpu_id].update(update)
+                        else:
+                            statuses[gpu_id] = update
                     except Empty:
                         break
                 
@@ -524,4 +525,3 @@ if __name__ == '__main__':
                         break
             
     print("\n" + "="*60 + "\n✅ Training session completed.\n" + "="*60)
-�
