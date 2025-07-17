@@ -256,21 +256,20 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
 
     # --- Rich UI Layout ---
     layout = Layout()
-    layout.split(
-        Layout(name="header", size=3),
-        Layout(ratio=1, name="main"),
-        Layout(size=10, name="footer")
+    # FIX: Use a vertical layout for better space management
+    layout.split_column(
+        Layout(Panel(f"🚀 [bold magenta]Starting Adversarial Patch Training[/bold magenta]\n"
+                     f"   - [b]Device[/b]: [cyan]{device.type.upper()}[/cyan]\n"
+                     f"   - [b]Batch Size[/b]: [cyan]{batch_size}[/cyan]\n"
+                     f"   - [b]Scaled LR[/b]: [cyan]{learning_rate:.2e}[/cyan]\n"
+                     f"   - [b]DataLoaders[/b]: [cyan]{num_workers}[/cyan]\n"
+                     f"   - [b]TV Weight[/b]: [cyan]{tv_weight}[/cyan]\n"
+                     f"   - [b]Patience[/b]: [cyan]{early_stopping_patience}[/cyan]",
+                     title="[yellow]Training Configuration[/yellow]", border_style="yellow"),
+               name="config", size=8),
+        Layout(name="progress", size=3),
+        Layout(name="table", ratio=1)
     )
-    # FIX: Give the side panel more space (40% of width)
-    layout["main"].split_row(Layout(name="side", ratio=2), Layout(name="body", ratio=3))
-    layout["footer"].update(Panel(f"🚀 [bold magenta]Starting Adversarial Patch Training[/bold magenta]\n"
-                                 f"   - [b]Device[/b]: [cyan]{device.type.upper()}[/cyan]\n"
-                                 f"   - [b]Batch Size[/b]: [cyan]{batch_size}[/cyan]\n"
-                                 f"   - [b]Scaled LR[/b]: [cyan]{learning_rate:.2e}[/cyan]\n"
-                                 f"   - [b]DataLoaders[/b]: [cyan]{num_workers}[/cyan]\n"
-                                 f"   - [b]TV Weight[/b]: [cyan]{tv_weight}[/cyan]\n"
-                                 f"   - [b]Patience[/b]: [cyan]{early_stopping_patience}[/cyan]",
-                                 title="[yellow]Training Configuration[/yellow]", border_style="yellow"))
     
     progress = Progress(
         TextColumn("[bold blue]{task.description}", justify="right"),
@@ -280,12 +279,11 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
         TimeRemainingColumn(),
         console=console
     )
-    layout["side"].update(Panel(progress, title="[yellow]Epoch Progress[/yellow]", border_style="yellow"))
+    layout["progress"].update(Panel(progress, title="[yellow]Current Epoch Progress[/yellow]", border_style="yellow"))
 
     best_loss = float('inf')
     epochs_no_improve = 0
     
-    # FIX: Store epoch results to rebuild table for highlighting
     epoch_results = []
     best_loss_epoch = -1
 
@@ -361,15 +359,13 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
             else:
                 epochs_no_improve += 1
             
-            # Store results of the current epoch
             epoch_results.append({
                 "epoch": epoch + 1, "duration": epoch_duration, "adv_loss": avg_adv_loss,
                 "tv_loss": avg_tv_loss, "total_loss": avg_total_loss, "lr": current_lr,
                 "patience": f"{epochs_no_improve}/{early_stopping_patience}"
             })
 
-            # Rebuild the results table to update highlighting
-            results_table = Table(title="Epoch Results", expand=True)
+            results_table = Table(title="Epoch Results", expand=True, border_style="blue")
             results_table.add_column("Epoch", justify="right", style="cyan")
             results_table.add_column("Time (s)", style="magenta")
             results_table.add_column("Adv Loss", style="green")
@@ -385,7 +381,7 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
                     f"{result['tv_loss']:.4f}", f"{result['total_loss']:.4f}", f"{result['lr']:.1e}",
                     result['patience'], style=row_style
                 )
-            layout["body"].update(results_table)
+            layout["table"].update(Panel(results_table, title="[blue]Training Log[/blue]", border_style="blue"))
             
             scheduler.step(avg_total_loss)
             writer.add_scalar('Loss/Adversarial', avg_adv_loss, epoch)
