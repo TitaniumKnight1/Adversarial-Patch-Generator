@@ -256,7 +256,6 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
 
     # --- Rich UI Layout ---
     layout = Layout()
-    # FIX: Use a vertical layout for better space management
     layout.split_column(
         Layout(Panel(f"🚀 [bold magenta]Starting Adversarial Patch Training[/bold magenta]\n"
                      f"   - [b]Device[/b]: [cyan]{device.type.upper()}[/cyan]\n"
@@ -373,15 +372,18 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
             results_table.add_column("Total Loss", style="bold red")
             results_table.add_column("LR", style="cyan")
             results_table.add_column("Patience", style="blue")
+            
+            # FIX: Only display the last N epochs to prevent overflow
+            display_epochs = epoch_results[-40:]
 
-            for result in epoch_results:
+            for result in display_epochs:
                 row_style = "bold green" if result["epoch"] == best_loss_epoch else ""
                 results_table.add_row(
                     f"{result['epoch']}", f"{result['duration']:.2f}", f"{result['adv_loss']:.4f}",
                     f"{result['tv_loss']:.4f}", f"{result['total_loss']:.4f}", f"{result['lr']:.1e}",
                     result['patience'], style=row_style
                 )
-            layout["table"].update(Panel(results_table, title="[blue]Training Log[/blue]", border_style="blue"))
+            layout["table"].update(Panel(results_table, title="[blue]Training Log (Recent Epochs)[/blue]", border_style="blue"))
             
             scheduler.step(avg_total_loss)
             writer.add_scalar('Loss/Adversarial', avg_adv_loss, epoch)
