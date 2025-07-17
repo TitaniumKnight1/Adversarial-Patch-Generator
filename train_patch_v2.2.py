@@ -63,7 +63,6 @@ class VisDroneDataset(Dataset):
         
         for img_name in tqdm(image_files, desc="Loading Data"):
             img_path = os.path.join(image_dir, img_name)
-            # Load image and store it in memory
             try:
                 with Image.open(img_path) as img:
                     self.images.append(img.convert("RGB"))
@@ -71,7 +70,6 @@ class VisDroneDataset(Dataset):
                 print(f"Warning: Could not load image {img_path}. Skipping. Error: {e}")
                 continue
 
-            # Load annotations and store them in memory
             boxes = []
             annotation_name = os.path.splitext(img_name)[0] + '.txt'
             annotation_path = os.path.join(annotation_dir, annotation_name)
@@ -95,16 +93,13 @@ class VisDroneDataset(Dataset):
         return len(self.images)
 
     def __getitem__(self, idx):
-        # Get pre-loaded image and annotations
         image = self.images[idx]
         boxes = self.annotations[idx]
         original_size = image.size
 
-        # Apply transformations on-the-fly
         if self.transform:
             image = self.transform(image)
         
-        # Scale bounding boxes to the new image size (640x640)
         if boxes.nelement() > 0:
             scale_x, scale_y = 640 / original_size[0], 640 / original_size[1]
             scaled_boxes = boxes.clone()
@@ -230,10 +225,8 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
     transform = T.Compose([T.Resize((640, 640)), T.ToTensor()])
     dataset = VisDroneDataset(root_dir=DATASET_PATH, transform=transform)
     
-    # FIX: Set num_workers to 0. When pre-loading the dataset to RAM,
-    # the overhead of multiprocessing can cause deadlocks and is often slower
-    # than loading from memory in the main thread. This resolves the hang at the start of an epoch.
-    num_workers = 0
+    # Reverting num_workers to diagnose the bottleneck with multiprocessing enabled.
+    num_workers = min(os.cpu_count() // 2, 16) if os.cpu_count() else 4
     pin_memory = (device.type == 'cuda')
     
     def collate_fn(batch):
@@ -248,7 +241,7 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
     print(f"   - Device: {bcolors.OKCYAN}{device.type.upper()}{bcolors.ENDC}")
     print(f"   - Batch Size: {bcolors.OKCYAN}{batch_size}{bcolors.ENDC}")
     print(f"   - Scaled LR: {bcolors.OKCYAN}{learning_rate:.2e}{bcolors.ENDC}")
-    print(f"   - DataLoaders: {bcolors.OKCYAN}{num_workers} (0 is optimal for pre-loaded data){bcolors.ENDC}")
+    print(f"   - DataLoaders: {bcolors.OKCYAN}{num_workers}{bcolors.ENDC}")
     print(f"   - TV Weight: {bcolors.OKCYAN}{tv_weight}{bcolors.ENDC}")
     print(f"   - Early Stopping Patience: {bcolors.OKCYAN}{EARLY_STOPPING_PATIENCE}{bcolors.ENDC}")
 
@@ -260,11 +253,21 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
         total_adv_loss, total_tv_loss = 0, 0
         
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{max_epochs}", ncols=120)
-
+        
+        loop_start_time = time.time()
         for i, (images, gt_boxes_batch) in enumerate(progress_bar):
-            if images is None: continue
-            images = images.to(device, non_blocking=pin_memory)
+            # --- DEBUG: Pinpoint data loading bottleneck ---
+            print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] DEBUG: Iter {i+1} - Dataloader fetch took: {time.time() - loop_start_time:.4f}s")
             
+            if images is None: 
+                loop_start_time = time.time()
+                continue
+            
+            step_start_time = time.time()
+            images = images.to(device, non_blocking=pin_memory)
+            print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] DEBUG: Iter {i+1} - Data to device took: {time.time() - step_start_time:.4f}s")
+            
+            step_start_time = time.time()
             angle, scale = random.uniform(-15, 15), random.uniform(0.8, 1.2)
             transformed_patch = TF.rotate(adversarial_patch, angle)
             transformed_patch = TF.resize(transformed_patch, (int(PATCH_SIZE * scale), int(PATCH_SIZE * scale)))
@@ -284,18 +287,26 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
                 else:
                     x_start, y_start = random.randint(0, 640 - PATCH_SIZE), random.randint(0, 640 - PATCH_SIZE)
                     images[img_idx, :, y_start:y_start+PATCH_SIZE, x_start:x_start+PATCH_SIZE] = transformed_patch
+            print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] DEBUG: Iter {i+1} - Patch transform & apply took: {time.time() - step_start_time:.4f}s")
 
+            step_start_time = time.time()
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device.type):
                 raw_preds = model.model(images)[0].transpose(1, 2)
                 adv_loss = -torch.mean(torch.max(raw_preds[..., 4:], dim=-1)[0])
                 tv_loss = total_variation(adversarial_patch)
                 total_loss = adv_loss + tv_weight * tv_loss
+            print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] DEBUG: Iter {i+1} - Forward pass took: {time.time() - step_start_time:.4f}s")
 
+            step_start_time = time.time()
             scaler.scale(total_loss).backward()
+            print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] DEBUG: Iter {i+1} - Backward pass took: {time.time() - step_start_time:.4f}s")
+
+            step_start_time = time.time()
             scaler.step(optimizer)
             scaler.update()
             adversarial_patch.data.clamp_(0, 1)
+            print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] DEBUG: Iter {i+1} - Optimizer step took: {time.time() - step_start_time:.4f}s")
             
             total_adv_loss += adv_loss.item()
             total_tv_loss += tv_loss.item()
@@ -306,6 +317,8 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
                 lr=f"{current_lr:.1e}",
                 best_loss=f"{best_loss:.4f}"
             )
+            # --- DEBUG: Mark start time for next dataloader fetch ---
+            loop_start_time = time.time()
 
         avg_adv_loss = total_adv_loss / len(dataloader) if len(dataloader) > 0 else 0
         avg_tv_loss = total_tv_loss / len(dataloader) if len(dataloader) > 0 else 0
@@ -364,7 +377,6 @@ if __name__ == '__main__':
     parser.add_argument('--gpu_ids', type=int, nargs='+', default=None, help='Specific GPU IDs to use (e.g., 0 1 2). If not specified, uses single GPU. If multiple IDs are given, enables DataParallel.')
     args = parser.parse_args()
 
-    # Set CUDA_VISIBLE_DEVICES to control which GPUs are visible to PyTorch
     if args.gpu_ids:
         os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, args.gpu_ids))
         print(f"✅ {bcolors.OKGREEN}Running on specified GPUs: {os.environ['CUDA_VISIBLE_DEVICES']}{bcolors.ENDC}")
