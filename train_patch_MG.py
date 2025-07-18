@@ -80,6 +80,11 @@ console = Console()
 # --- DDP Helper Functions ---
 def setup_ddp(rank, world_size):
     """Initializes the distributed process group."""
+    # Force NCCL to use a specific network interface (loopback for single-node)
+    # This is a common fix for timeout issues on multi-homed servers.
+    if 'NCCL_SOCKET_IFNAME' not in os.environ:
+        os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
+        
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355' # A free port
     # Increase timeout to handle potential network/storage delays during setup
@@ -565,9 +570,14 @@ def main():
 
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
+    
+    is_distributed = world_size > 1
+    if is_distributed:
+        # Setup the main NCCL process group for training
+        setup_ddp(rank, world_size)
 
     # --- Add a warning if not using torchrun correctly ---
-    if rank == 0 and world_size == 1 and torch.cuda.device_count() > 1:
+    if rank == 0 and not is_distributed and torch.cuda.device_count() > 1:
         console.print(Panel(
             "[bold yellow]WARNING: Multiple GPUs detected, but the script is running on a single process.[/bold yellow]\n\n"
             "To use all available GPUs for distributed training, you MUST launch this script using `torchrun`.\n\n"
@@ -578,8 +588,9 @@ def main():
         ))
 
     # --- Setup Logging and Exception Hook ---
+    # Determine log_dir on main process
     log_dir = None
-    if rank == 0:
+    if is_main_process():
         session_timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         log_dir_base = "runs"
         log_dir = os.path.join(log_dir_base, session_timestamp)
@@ -588,21 +599,12 @@ def main():
             log_dir = os.path.dirname(os.path.dirname(args.resume))
     
     # Broadcast the log_dir from the main process to all other processes
-    log_dir_list = [log_dir]
-    if world_size > 1:
-        # Use a temporary process group to broadcast the log directory
-        try:
-            # Use gloo backend for this simple CPU-based broadcast
-            dist.init_process_group("gloo", rank=rank, world_size=world_size, timeout=datetime.timedelta(seconds=30))
-            dist.broadcast_object_list(log_dir_list, src=0)
-            dist.destroy_process_group()
-        except Exception as e:
-            # Fallback for safety, though it should not happen with torchrun
-            if rank == 0:
-                console.print(f"[bold red]Could not broadcast log directory. Error: {e}[/bold red]")
-    log_dir = log_dir_list[0]
+    if is_distributed:
+        log_dir_list = [log_dir]
+        dist.broadcast_object_list(log_dir_list, src=0)
+        log_dir = log_dir_list[0]
 
-    # Setup logging for all processes
+    # Now all processes have the correct log_dir
     setup_logging(log_dir, rank)
     # Set the global exception hook to use our logger
     sys.excepthook = handle_exception
@@ -611,7 +613,7 @@ def main():
     logging.getLogger("ultralytics").setLevel(logging.WARNING)
 
     # --- Pre-flight check for dataset cache (run by main process ONLY) ---
-    if rank == 0:
+    if is_main_process():
         console.print(Panel(
             "[bold yellow]Script Initializing...[/bold yellow]\n\n"
             "Welcome! The script is starting up. Please be patient.\n\n"
@@ -628,11 +630,6 @@ def main():
             if not os.path.exists(cache_path):
                 transform = T.Compose([T.Resize((640, 640)), T.ToTensor()])
                 VisDroneDatasetPreload(root_dir=DATASET_PATH, transform=transform, create_cache=True)
-
-    is_distributed = world_size > 1
-    if is_distributed:
-        # Setup the main NCCL process group for training
-        setup_ddp(rank, world_size)
 
     try:
         if is_main_process():
