@@ -178,17 +178,29 @@ class VisDroneDatasetPreload(Dataset):
     def _create_cache(self, root_dir, transform, cache_path):
         """Logic for creating the cache, only run by the main process."""
         console.print(f"⏳ [magenta][Rank 0] No cache found. Starting pre-processing of dataset.[/magenta]")
-        console.print(f"   [yellow]This is a one-time operation and may take a significant amount of time.[/yellow]")
         self.images = []
         self.annotations = []
         image_dir = os.path.join(root_dir, 'images')
         annotation_dir = os.path.join(root_dir, 'annotations_v11')
         image_files = sorted(os.listdir(image_dir))
         
-        with Progress(console=console, disable=not is_main_process()) as progress:
-            task = progress.add_task("[cyan]Processing Data...", total=len(image_files))
+        # Define a feature-rich progress bar for the caching process
+        caching_progress = Progress(
+            TextColumn("[cyan]Caching Dataset..."),
+            BarColumn(),
+            "[progress.percentage]{task.percentage:>3.1f}%",
+            "•",
+            MofNCompleteColumn(),
+            "•",
+            TimeRemainingColumn(),
+            console=console,
+            disable=not is_main_process()
+        )
+        
+        with caching_progress:
+            task = caching_progress.add_task("Processing images", total=len(image_files))
             for img_name in image_files:
-                progress.update(task, advance=1)
+                caching_progress.update(task, advance=1)
                 img_path = os.path.join(image_dir, img_name)
                 try:
                     with Image.open(img_path) as img:
@@ -474,6 +486,19 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
 
 
 def main():
+    # This message will now print from the main process as soon as the script is invoked.
+    # It runs before DDP setup, ensuring the user gets immediate feedback.
+    if int(os.environ.get("RANK", 0)) == 0:
+        console.print(Panel(
+            "[bold yellow]Script Initializing...[/bold yellow]\n\n"
+            "Welcome! The script is starting up. Please be patient.\n\n"
+            "• [bold]First-time run:[/bold] The script will cache the entire dataset. This is a one-time operation that can take [cyan]10-30+ minutes[/cyan] depending on your storage speed. A progress bar will be displayed below.\n"
+            "• [bold]Subsequent runs:[/bold] Startup will be much faster as the script will load the cached dataset.",
+            title="[bold magenta]Startup Information[/bold magenta]",
+            border_style="magenta",
+            expand=False
+        ))
+
     parser = argparse.ArgumentParser(description="Distributed training of adversarial patches using DDP.")
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume a specific run.')
     parser.add_argument('--starter_image', type=str, default=None, help='Path to an image to use as the starting point for the patch.')
