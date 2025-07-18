@@ -111,8 +111,6 @@ class VisDroneDatasetLazy(Dataset):
         self.image_dir = os.path.join(root_dir, 'images')
         self.annotation_dir = os.path.join(root_dir, 'annotations_v11')
         self.image_files = sorted(os.listdir(self.image_dir))
-        if is_main_process():
-            logging.info(f"Lazy Dataset initialized. Found {len(self.image_files)} images.")
 
     def __len__(self):
         return len(self.image_files)
@@ -124,6 +122,7 @@ class VisDroneDatasetLazy(Dataset):
             image = Image.open(img_path).convert("RGB")
             original_size = image.size
         except Exception:
+            logging.warning(f"Could not load image {img_path}. Skipping.")
             return None
         boxes = []
         annotation_name = os.path.splitext(img_name)[0] + '.txt'
@@ -151,19 +150,19 @@ class VisDroneDatasetPreload(Dataset):
     def __init__(self, root_dir, transform=None, create_cache=False):
         self.cache_path = os.path.join(root_dir, CACHE_FILE)
         
-        # This flag is used for the pre-flight check before DDP starts
         if create_cache:
             self._create_cache(root_dir, transform, self.cache_path)
+            # After creating the cache, we need to load it.
+            # The constructor will be called again without create_cache=True.
+            # To avoid loading twice, we can just return here and let the main process re-init.
             return
 
-        # Regular initialization: just load the data from the guaranteed-to-exist cache
         cached_data = torch.load(self.cache_path, map_location='cpu')
         self.images = cached_data['images']
         self.annotations = cached_data['annotations']
 
     def _create_cache(self, root_dir, transform, cache_path):
         """Logic for creating the cache, only run by the main process."""
-        logging.info("No cache found. Starting pre-processing of dataset.")
         self.images = []
         self.annotations = []
         image_dir = os.path.join(root_dir, 'images')
@@ -190,7 +189,8 @@ class VisDroneDatasetPreload(Dataset):
                         original_size = img_rgb.size
                         self.images.append(transform(img_rgb) if transform else TF.to_tensor(img_rgb))
                 except Exception as e:
-                    live.console.print(f"Warning: Could not load image {img_path}. Skipping. Error: {e}", style="yellow")
+                    # Use logging for warnings instead of printing directly to console
+                    logging.warning(f"Could not load image {img_path}. Skipping. Error: {e}")
                     continue
                 boxes = []
                 annotation_name = f"{os.path.splitext(img_name)[0]}.txt"
@@ -212,10 +212,9 @@ class VisDroneDatasetPreload(Dataset):
                     boxes_tensor[:, [1, 3]] *= scale_y
                 self.annotations.append(boxes_tensor)
         
-        logging.info(f"Caching complete. Saving to {cache_path}...")
         try:
             torch.save({'images': self.images, 'annotations': self.annotations}, cache_path)
-            logging.info("Dataset cached successfully.")
+            logging.info("Dataset cached successfully.") # This will not be shown, as requested
         except Exception as e:
             logging.error(f"Could not save cache file: {e}")
 
@@ -239,7 +238,7 @@ class TotalVariationLoss(torch.nn.Module):
 
 def autotune_batch_size(device, model, dataset_len, initial_batch_size=2):
     batch_size = initial_batch_size
-    logging.info(f"Starting BATCH SIZE autotune (for a single GPU) from size {batch_size}...")
+    logging.info(f"Starting BATCH SIZE autotune from size {batch_size}...")
     while True:
         if batch_size > dataset_len:
             logging.info(f"Batch size ({batch_size}) exceeds dataset size. Using previous valid size.")
@@ -250,7 +249,6 @@ def autotune_batch_size(device, model, dataset_len, initial_batch_size=2):
             images = next(iter(dataloader)).to(device)
             images.requires_grad_(True)
             with torch.amp.autocast(device_type='cuda'):
-                # The model object passed in is already the nn.Module, so call it directly.
                 output = model(images)
                 dummy_loss = output[0].sum()
             dummy_loss.backward()
@@ -275,32 +273,29 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
     writer = SummaryWriter(log_dir=log_dir) if is_main_process() else None
     
     device = rank 
-    model = YOLO(MODEL_NAME).to(device)
-    model.model.train()
+    yolo_wrapper = YOLO(MODEL_NAME).to(device)
+    model = yolo_wrapper.model # Use the underlying nn.Module for training
+    model.train()
 
     if is_distributed:
-        model.model = DDP(model.model, device_ids=[device], find_unused_parameters=False)
+        model = DDP(model, device_ids=[device], find_unused_parameters=False)
     
     try:
-        # When using DDP, compile the underlying module
-        model_to_compile = model.model.module if is_distributed else model.model
+        model_to_compile = model.module if is_distributed else model
         model_to_compile = torch.compile(model_to_compile)
         if is_distributed:
-            model.model.module = model_to_compile
+            model.module = model_to_compile
         else:
-            model.model = model_to_compile
-        if is_main_process(): logging.info("Model compiled successfully with torch.compile().")
+            model = model_to_compile
     except Exception as e:
-        if is_main_process(): logging.warning(f"torch.compile() failed: {e}. Running without compilation.")
+        logging.warning(f"torch.compile() failed: {e}. Running without compilation.")
 
     if args.starter_image and os.path.exists(args.starter_image):
-        if is_main_process(): logging.info(f"Initializing patch from starter image: {args.starter_image}")
         starter_image = Image.open(args.starter_image).convert("RGB")
         transform_starter = T.Compose([T.Resize((PATCH_SIZE, PATCH_SIZE)), T.ToTensor()])
         adversarial_patch = transform_starter(starter_image).to(device, non_blocking=True)
         adversarial_patch.requires_grad_(True)
     else:
-        if is_main_process(): logging.info("Initializing patch with random noise.")
         adversarial_patch = torch.rand((3, PATCH_SIZE, PATCH_SIZE), device=device, requires_grad=True)
 
     optimizer = torch.optim.Adam([adversarial_patch], lr=learning_rate, amsgrad=True)
@@ -310,23 +305,20 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
     start_epoch = 0
 
     if args.resume and os.path.exists(args.resume):
-        if is_main_process(): logging.info(f"Resuming training from checkpoint: {args.resume}")
         checkpoint = torch.load(args.resume, map_location=f'cuda:{rank}')
-        model_to_load = model.model.module if is_distributed else model.model
+        model_to_load = model.module if is_distributed else model
         model_to_load.load_state_dict(checkpoint['model_state_dict'])
         adversarial_patch.data = checkpoint['patch_state_dict'].to(device)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if 'scaler_state_dict' in checkpoint: scaler.load_state_dict(checkpoint['scaler_state_dict'])
         if 'scheduler_state_dict' in checkpoint: scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         start_epoch = checkpoint['epoch']
-        if is_main_process(): logging.info(f"Resumed from epoch {start_epoch}.")
 
     patch_augmentations = torch.nn.Sequential(
         K.RandomAffine(degrees=(-15, 15), scale=(0.8, 1.2), p=1.0),
         K.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.0, hue=0.0, p=1.0),
     ).to(device)
 
-    # --- Data Loading ---
     transform = T.Compose([T.Resize((640, 640)), T.ToTensor()])
     available_ram_gb = psutil.virtual_memory().available / (1024 ** 3)
     
@@ -334,13 +326,11 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
     if use_preload:
         dataset = VisDroneDatasetPreload(root_dir=DATASET_PATH, transform=transform)
     else:
-        if is_main_process(): logging.info("Using memory-safe on-demand disk loading strategy.")
         dataset = VisDroneDatasetLazy(root_dir=DATASET_PATH, transform=transform)
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if is_distributed else None
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=(sampler is None), num_workers=0 if use_preload else min(os.cpu_count() // world_size, 16), pin_memory=True, collate_fn=collate_fn, sampler=sampler, persistent_workers=True if (0 if use_preload else min(os.cpu_count() // world_size, 16)) > 0 else False)
 
-    # --- UI Setup (Main Process Only) ---
     live = None
     if is_main_process():
         layout = Layout()
@@ -369,8 +359,6 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
     for epoch in range(start_epoch, args.max_epochs):
         if is_distributed:
             sampler.set_epoch(epoch)
-        epoch_start_time = time.time()
-        total_adv_loss, total_tv_loss = 0, 0
         
         task_id = progress.add_task(f"Epoch {epoch + 1}", total=len(dataloader)) if is_main_process() else None
 
@@ -413,23 +401,15 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
             scaler.update()
             adversarial_patch.data.clamp_(0, 1)
             
-            if is_distributed:
-                dist.all_reduce(total_loss, op=dist.ReduceOp.AVG)
-                dist.all_reduce(adv_loss, op=dist.ReduceOp.AVG)
-                dist.all_reduce(tv_loss, op=dist.ReduceOp.AVG)
-            
-            total_adv_loss += adv_loss.item()
-            total_tv_loss += tv_loss.item()
             if is_main_process(): progress.update(task_id, advance=1)
 
-        if is_main_process(): progress.remove_task(task_id)
-        
         if is_main_process():
-            avg_adv_loss = total_adv_loss / len(dataloader)
-            avg_tv_loss = total_tv_loss / len(dataloader)
-            avg_total_loss = avg_adv_loss + args.tv_weight * avg_tv_loss
-            epoch_duration = time.time() - epoch_start_time
-            current_lr = optimizer.param_groups[0]['lr']
+            progress.remove_task(task_id)
+            
+            total_loss_tensor = torch.tensor(total_loss.item()).to(device)
+            if is_distributed:
+                dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.AVG)
+            avg_total_loss = total_loss_tensor.item()
             
             if avg_total_loss < best_loss:
                 best_loss = avg_total_loss
@@ -437,31 +417,23 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
                 best_loss_epoch = epoch + 1
                 unwrapped_model = model.module if is_distributed else model
                 unwrapped_model = unwrapped_model.module if hasattr(unwrapped_model, 'module') else unwrapped_model
-                save_dict = {
-                    'epoch': epoch + 1, 
-                    'model_state_dict': unwrapped_model.state_dict(),
-                    'patch_state_dict': adversarial_patch.data.clone(), 
-                    'optimizer_state_dict': optimizer.state_dict(), 
-                    'scaler_state_dict': scaler.state_dict(), 
-                    'scheduler_state_dict': scheduler.state_dict(), 
-                    'batch_size': batch_size
-                }
+                save_dict = { 'epoch': epoch + 1, 'model_state_dict': unwrapped_model.state_dict(), 'patch_state_dict': adversarial_patch.data.clone(), 'optimizer_state_dict': optimizer.state_dict(), 'scaler_state_dict': scaler.state_dict(), 'scheduler_state_dict': scheduler.state_dict(), 'batch_size': batch_size }
                 torch.save(save_dict, os.path.join(log_dir, BEST_CHECKPOINT_FILE))
                 T.ToPILImage()(adversarial_patch.cpu()).save(os.path.join(log_dir, "best_patch.png"))
             else:
                 epochs_no_improve += 1
             
-            epoch_results.append({"epoch": epoch + 1, "duration": epoch_duration, "adv_loss": avg_adv_loss, "tv_loss": avg_tv_loss, "total_loss": avg_total_loss, "lr": current_lr, "patience": f"{epochs_no_improve}/{args.early_stopping_patience}"})
+            epoch_results.append({"epoch": epoch + 1, "total_loss": avg_total_loss, "lr": optimizer.param_groups[0]['lr'], "patience": f"{epochs_no_improve}/{args.early_stopping_patience}"})
             
             results_table = Table(title="Epoch Results", expand=True, border_style="blue")
-            results_table.add_column("Epoch", justify="right", style="cyan"); results_table.add_column("Time (s)", style="magenta"); results_table.add_column("Adv Loss", style="green"); results_table.add_column("TV Loss", style="yellow"); results_table.add_column("Total Loss", style="bold red"); results_table.add_column("LR", style="cyan"); results_table.add_column("Patience", style="blue")
+            results_table.add_column("Epoch", justify="right", style="cyan"); results_table.add_column("Total Loss", style="bold red"); results_table.add_column("LR", style="cyan"); results_table.add_column("Patience", style="blue")
             for result in epoch_results[-40:]:
                 row_style = "bold green" if result["epoch"] == best_loss_epoch else ""
-                results_table.add_row(f"{result['epoch']}", f"{result['duration']:.2f}", f"{result['adv_loss']:.4f}", f"{result['tv_loss']:.4f}", f"{result['total_loss']:.4f}", f"{result['lr']:.1e}", result['patience'], style=row_style)
+                results_table.add_row(f"{result['epoch']}", f"{result['total_loss']:.4f}", f"{result['lr']:.1e}", result['patience'], style=row_style)
             layout["table"].update(Panel(results_table, title="[blue]Training Log (Recent Epochs)[/blue]", border_style="blue"))
             
             scheduler.step(avg_total_loss)
-            writer.add_scalar('Loss/Adversarial', avg_adv_loss, epoch); writer.add_scalar('Loss/TotalVariation', avg_tv_loss, epoch); writer.add_scalar('Loss/Total', avg_total_loss, epoch); writer.add_scalar('Learning_Rate', current_lr, epoch); writer.add_image('Adversarial Patch', adversarial_patch, epoch)
+            writer.add_scalar('Loss/Total', avg_total_loss, epoch); writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch); writer.add_image('Adversarial Patch', adversarial_patch, epoch)
             
             stop_signal = torch.tensor([0]).to(device)
             if epochs_no_improve >= args.early_stopping_patience:
@@ -481,40 +453,53 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
 
 
 def setup_logging(log_dir, rank):
-    """Configures logging to file and console."""
-    log_format = "%(asctime)s - %(levelname)s - [Rank %(rank)s] - %(message)s"
+    """
+    Configures logging.
+    - Terminal (rank 0 only): Shows only ERROR and CRITICAL messages.
+    - File (all ranks): Writes only ERROR and CRITICAL messages to 'training.log'.
+    """
+    log_format = "%(asctime)s - RANK:%(rank)s - %(levelname)s - %(message)s"
     
-    # Root logger
     logger = logging.getLogger()
-    logger.setLevel(logging.DEBUG) # Set the lowest level to capture everything
+    # Set the lowest level to capture all messages. Handlers will filter them.
+    logger.setLevel(logging.DEBUG) 
 
-    # File handler - captures EVERYTHING (DEBUG and up) to the log file
-    if rank == 0:
-        os.makedirs(log_dir, exist_ok=True)
-        file_handler = logging.FileHandler(os.path.join(log_dir, "training.log"))
-        file_handler.setLevel(logging.DEBUG)
-        file_formatter = logging.Formatter(log_format)
-        file_handler.setFormatter(file_formatter)
-        logger.addHandler(file_handler)
+    # Clear any existing handlers to prevent duplicate logs.
+    if logger.hasHandlers():
+        logger.handlers.clear()
 
-    # Rich handler for console output - only shows WARNINGS and above
+    # --- Error Log File Handler (for all processes) ---
+    # This handler writes only ERROR and CRITICAL messages to a single file.
+    # File appends are generally atomic on modern OSes, making this safe for DDP.
+    os.makedirs(log_dir, exist_ok=True)
+    error_file_handler = logging.FileHandler(os.path.join(log_dir, "training.log"), mode='a')
+    error_file_handler.setLevel(logging.ERROR)
+    error_formatter = logging.Formatter(log_format)
+    error_file_handler.setFormatter(error_formatter)
+    
+    # Custom filter to add rank information to the log record
+    class RankFilter(logging.Filter):
+        def filter(self, record):
+            record.rank = rank
+            return True
+    error_file_handler.addFilter(RankFilter())
+    logger.addHandler(error_file_handler)
+
+    # --- Console Handler (for main process ONLY) ---
+    # This handler uses Rich to print ERROR and CRITICAL messages to the terminal.
     if rank == 0:
-        # This handler controls what the user sees in the console.
-        # Setting the level to WARNING hides INFO and DEBUG messages.
-        rich_handler = RichHandler(console=console, rich_tracebacks=True, show_path=False)
-        rich_handler.setLevel(logging.WARNING) 
+        # Set the level on the handler to filter what gets to the console.
+        rich_handler = RichHandler(
+            console=console, 
+            rich_tracebacks=True, 
+            show_path=False, 
+            level=logging.ERROR
+        )
         logger.addHandler(rich_handler)
     else:
-        # Other processes should not produce any log output.
+        # For all other processes, add a NullHandler to suppress all logging output
+        # to the console and prevent 'No handler found' warnings.
         logger.addHandler(logging.NullHandler())
-
-    # Custom adapter to add rank to log records for file logging
-    class RankAdapter(logging.LoggerAdapter):
-        def process(self, msg, kwargs):
-            return '[Rank %s] %s' % (self.extra['rank'], msg), kwargs
-
-    logger = RankAdapter(logger, {'rank': rank})
-    return logger
 
 def handle_exception(exc_type, exc_value, exc_traceback):
     """Global exception hook to log unhandled exceptions."""
@@ -525,6 +510,9 @@ def handle_exception(exc_type, exc_value, exc_traceback):
     logging.critical("Unhandled exception", exc_info=(exc_type, exc_value, exc_traceback))
 
 def main():
+    # --- Set RUST_LOG to control TensorBoard's Rust backend logging ---
+    os.environ['RUST_LOG'] = 'error'
+    
     parser = argparse.ArgumentParser(description="Distributed training of adversarial patches using DDP.")
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume a specific run.')
     parser.add_argument('--starter_image', type=str, default=None, help='Path to an image to use as the starting point for the patch.')
@@ -536,41 +524,44 @@ def main():
 
     args = parser.parse_args()
 
-    # This environment variable is set by torchrun. Default to 0 if not set (for single-process debugging).
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
     # --- Setup Logging and Exception Hook ---
-    # The log directory is determined before DDP setup so the log file is ready.
     log_dir = None
     if rank == 0:
         session_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         log_dir_base = "runs"
         log_dir = os.path.join(log_dir_base, session_timestamp)
         if args.resume:
-            log_dir = os.path.dirname(args.resume)
-        os.makedirs(log_dir, exist_ok=True)
+            # If resuming, use the original log directory
+            log_dir = os.path.dirname(os.path.dirname(args.resume))
     
-    # Broadcast the log_dir to all processes
+    # Broadcast the log_dir from the main process to all other processes
     log_dir_list = [log_dir]
     if world_size > 1:
-        # Temporarily initialize a basic process group just for this broadcast
-        # This is a workaround to share the log_dir before the main DDP setup
+        # Use a temporary process group to broadcast the log directory
         try:
-            dist.init_process_group("gloo", rank=rank, world_size=world_size, timeout=datetime.timedelta(seconds=20))
+            # Use gloo backend for this simple CPU-based broadcast
+            dist.init_process_group("gloo", rank=rank, world_size=world_size, timeout=datetime.timedelta(seconds=30))
             dist.broadcast_object_list(log_dir_list, src=0)
             dist.destroy_process_group()
         except Exception as e:
+            # Fallback for safety, though it should not happen with torchrun
             if rank == 0:
-                console.print(f"[bold red]Could not broadcast log directory. Each process will log separately. Error: {e}[/bold red]")
+                console.print(f"[bold red]Could not broadcast log directory. Error: {e}[/bold red]")
     log_dir = log_dir_list[0]
 
+    # Setup logging for all processes
     setup_logging(log_dir, rank)
+    # Set the global exception hook to use our logger
     sys.excepthook = handle_exception
+
+    # --- Silence Ultralytics Logger ---
+    logging.getLogger("ultralytics").setLevel(logging.WARNING)
 
     # --- Pre-flight check for dataset cache (run by main process ONLY) ---
     if rank == 0:
-        # Use console.print for UI elements, and logging for status messages
         console.print(Panel(
             "[bold yellow]Script Initializing...[/bold yellow]\n\n"
             "Welcome! The script is starting up. Please be patient.\n\n"
@@ -585,16 +576,13 @@ def main():
         if available_ram_gb > RAM_THRESHOLD_GB:
             cache_path = os.path.join(DATASET_PATH, CACHE_FILE)
             if not os.path.exists(cache_path):
-                # This creates a temporary instance just to trigger the caching logic.
                 transform = T.Compose([T.Resize((640, 640)), T.ToTensor()])
                 VisDroneDatasetPreload(root_dir=DATASET_PATH, transform=transform, create_cache=True)
 
-    # If running in a distributed setting, initialize the process group
     is_distributed = world_size > 1
     if is_distributed:
+        # Setup the main NCCL process group for training
         setup_ddp(rank, world_size)
-        if is_main_process():
-            logging.info(f"DDP setup complete for {world_size} processes. Main process (Rank 0) is running on CUDA device: {torch.cuda.current_device()}")
 
     try:
         if is_main_process():
@@ -614,17 +602,13 @@ def main():
         final_batch_size = 0
         if args.batch_size:
             final_batch_size = args.batch_size
-            if is_main_process(): logging.info(f"Using user-provided per-GPU batch size: {final_batch_size}")
         elif args.resume:
             if is_main_process():
                 checkpoint = torch.load(args.resume, map_location='cpu')
                 final_batch_size = checkpoint.get('batch_size', BASE_BATCH_SIZE)
-                logging.info(f"Resuming with batch size {final_batch_size} from checkpoint.")
         else:
             if is_main_process():
-                logging.info("Starting batch size autotune on Rank 0...")
                 temp_model = YOLO(MODEL_NAME).to(rank)
-                # Pass the underlying model.model to the autotuner
                 final_batch_size = autotune_batch_size(device=rank, model=temp_model.model, dataset_len=temp_dataset_len)
                 del temp_model
                 torch.cuda.empty_cache()
@@ -633,24 +617,16 @@ def main():
             batch_size_tensor = torch.tensor([final_batch_size], dtype=torch.int64).to(rank)
             dist.broadcast(batch_size_tensor, src=0)
             final_batch_size = batch_size_tensor.item()
-            if is_main_process():
-                 logging.info(f"Determined and broadcasted batch size: {final_batch_size}")
 
         effective_batch_size = final_batch_size * world_size
         scaled_lr = BASE_LEARNING_RATE * math.sqrt(effective_batch_size / BASE_BATCH_SIZE)
         
-        if is_main_process():
-            logging.info("Setup complete. Starting training loop...")
-
         train_adversarial_patch(rank, world_size, args, final_batch_size, scaled_lr, log_dir)
 
     except Exception as e:
         logging.critical("A critical error occurred in the main execution block.", exc_info=True)
-        # The sys.excepthook will also catch this, but logging it here provides context.
     finally:
         if is_distributed:
-            if is_main_process():
-                logging.info("Main process (Rank 0) cleaning up DDP.")
             cleanup_ddp()
 
 if __name__ == '__main__':
