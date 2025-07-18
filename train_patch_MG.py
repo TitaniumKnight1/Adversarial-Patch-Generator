@@ -267,6 +267,7 @@ def autotune_batch_size(device, model, dataset_len, initial_batch_size=2):
 
 def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, log_dir):
     """Main training function, now aware of its rank and the world size."""
+    is_distributed = world_size > 1
     if is_main_process(): cudnn.benchmark = True
     
     writer = SummaryWriter(log_dir=log_dir) if is_main_process() else None
@@ -275,10 +276,17 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
     model = YOLO(MODEL_NAME).to(device)
     model.model.train()
 
-    model.model = DDP(model.model, device_ids=[device], find_unused_parameters=False)
+    if is_distributed:
+        model.model = DDP(model.model, device_ids=[device], find_unused_parameters=False)
     
     try:
-        model.model = torch.compile(model.model)
+        # When using DDP, compile the underlying module
+        model_to_compile = model.model.module if is_distributed else model.model
+        model_to_compile = torch.compile(model_to_compile)
+        if is_distributed:
+            model.model.module = model_to_compile
+        else:
+            model.model = model_to_compile
         if is_main_process(): console.print("✅ [green]Model compiled successfully with torch.compile().[/green]")
     except Exception as e:
         if is_main_process(): console.print(f"⚠️ [yellow]torch.compile() failed: {e}. Running without compilation.[/yellow]")
@@ -302,7 +310,8 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
     if args.resume and os.path.exists(args.resume):
         if is_main_process(): console.print(f"🔄 [blue]Resuming training from checkpoint: {args.resume}[/blue]")
         checkpoint = torch.load(args.resume, map_location=f'cuda:{rank}')
-        model.model.module.load_state_dict(checkpoint['model_state_dict'])
+        model_to_load = model.model.module if is_distributed else model.model
+        model_to_load.load_state_dict(checkpoint['model_state_dict'])
         adversarial_patch.data = checkpoint['patch_state_dict'].to(device)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if 'scaler_state_dict' in checkpoint: scaler.load_state_dict(checkpoint['scaler_state_dict'])
@@ -321,15 +330,13 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
     
     use_preload = available_ram_gb > RAM_THRESHOLD_GB
     if use_preload:
-        # Now this just loads the data from the pre-existing cache
         dataset = VisDroneDatasetPreload(root_dir=DATASET_PATH, transform=transform)
     else:
         if is_main_process(): console.print(f"💾 [magenta]Using memory-safe on-demand disk loading strategy.[/magenta]")
         dataset = VisDroneDatasetLazy(root_dir=DATASET_PATH, transform=transform)
 
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    num_workers = 0 if use_preload else min(os.cpu_count() // world_size, 16)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, collate_fn=collate_fn, sampler=sampler, persistent_workers=True if num_workers > 0 else False)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if is_distributed else None
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=(sampler is None), num_workers=0 if use_preload else min(os.cpu_count() // world_size, 16), pin_memory=True, collate_fn=collate_fn, sampler=sampler, persistent_workers=True if (0 if use_preload else min(os.cpu_count() // world_size, 16)) > 0 else False)
 
     # --- UI Setup (Main Process Only) ---
     live = None
@@ -341,7 +348,7 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
                          f"   - [b]Batch Size (per GPU)[/b]: [cyan]{batch_size}[/cyan]\n"
                          f"   - [b]Effective Batch Size[/b]: [cyan]{batch_size * world_size}[/cyan]\n"
                          f"   - [b]Scaled LR[/b]: [cyan]{learning_rate:.2e}[/cyan]\n"
-                         f"   - [b]DataLoaders (per GPU)[/b]: [cyan]{num_workers}[/cyan]",
+                         f"   - [b]DataLoaders (per GPU)[/b]: [cyan]{0 if use_preload else min(os.cpu_count() // world_size, 16)}[/cyan]",
                          title="[yellow]Training Configuration[/yellow]", border_style="yellow"),
                    name="config", size=9),
             Layout(name="progress", size=3),
@@ -358,7 +365,8 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
     best_loss_epoch = -1
 
     for epoch in range(start_epoch, args.max_epochs):
-        sampler.set_epoch(epoch)
+        if is_distributed:
+            sampler.set_epoch(epoch)
         epoch_start_time = time.time()
         total_adv_loss, total_tv_loss = 0, 0
         
@@ -403,9 +411,10 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
             scaler.update()
             adversarial_patch.data.clamp_(0, 1)
             
-            dist.all_reduce(total_loss, op=dist.ReduceOp.AVG)
-            dist.all_reduce(adv_loss, op=dist.ReduceOp.AVG)
-            dist.all_reduce(tv_loss, op=dist.ReduceOp.AVG)
+            if is_distributed:
+                dist.all_reduce(total_loss, op=dist.ReduceOp.AVG)
+                dist.all_reduce(adv_loss, op=dist.ReduceOp.AVG)
+                dist.all_reduce(tv_loss, op=dist.ReduceOp.AVG)
             
             total_adv_loss += adv_loss.item()
             total_tv_loss += tv_loss.item()
@@ -424,7 +433,8 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
                 best_loss = avg_total_loss
                 epochs_no_improve = 0
                 best_loss_epoch = epoch + 1
-                unwrapped_model = model.module.module if hasattr(model.module, 'module') else model.module
+                unwrapped_model = model.module if is_distributed else model
+                unwrapped_model = unwrapped_model.module if hasattr(unwrapped_model, 'module') else unwrapped_model
                 save_dict = {
                     'epoch': epoch + 1, 
                     'model_state_dict': unwrapped_model.state_dict(),
@@ -456,9 +466,10 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
                 if live: live.stop()
                 console.print(f"\n🛑 [bold red]Early stopping triggered after {args.early_stopping_patience} epochs with no improvement.[/bold red]")
                 stop_signal = torch.tensor([1]).to(device)
-            dist.broadcast(stop_signal, src=0)
+            if is_distributed:
+                dist.broadcast(stop_signal, src=0)
             if stop_signal.item() == 1: break
-        else:
+        elif is_distributed:
             stop_signal = torch.tensor([0]).to(device)
             dist.broadcast(stop_signal, src=0)
             if stop_signal.item() == 1: break
@@ -539,7 +550,7 @@ def main():
             if is_main_process():
                 console.print(f"🛠️ [magenta]Starting batch size autotune on Rank 0...[/magenta]")
                 temp_model = YOLO(MODEL_NAME).to(rank)
-                temp_model.model.train()
+                # Pass the underlying model.model to the autotuner
                 final_batch_size = autotune_batch_size(device=rank, model=temp_model.model, dataset_len=temp_dataset_len)
                 del temp_model
                 torch.cuda.empty_cache()
