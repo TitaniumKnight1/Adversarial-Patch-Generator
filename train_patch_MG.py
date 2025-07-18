@@ -80,7 +80,9 @@ def setup_ddp(rank, world_size):
     """Initializes the distributed process group."""
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355' # A free port
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    # Increase timeout to handle potential network/storage delays during setup
+    timeout = datetime.timedelta(minutes=30)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size, timeout=timeout)
     torch.cuda.set_device(rank)
 
 def cleanup_ddp():
@@ -144,32 +146,18 @@ class VisDroneDatasetLazy(Dataset):
         return image, boxes_tensor
 
 class VisDroneDatasetPreload(Dataset):
-    def __init__(self, root_dir, transform=None):
-        cache_path = os.path.join(root_dir, CACHE_FILE)
+    def __init__(self, root_dir, transform=None, create_cache=False):
+        self.cache_path = os.path.join(root_dir, CACHE_FILE)
         
-        if is_main_process():
-            if os.path.exists(cache_path):
-                console.print(f"✅ Main process found existing cache. Loading from: {cache_path}")
-                try:
-                    cached_data = torch.load(cache_path, map_location='cpu')
-                    self.images = cached_data['images']
-                    self.annotations = cached_data['annotations']
-                    console.print(f"✅ Cached dataset loaded successfully. {len(self.images)} items in memory.")
-                except Exception as e:
-                    console.print(f"⚠️ Could not load cache file: {e}. Re-processing dataset.")
-                    self._create_cache(root_dir, transform, cache_path)
-            else:
-                self._create_cache(root_dir, transform, cache_path)
-        
-        # All processes must wait here for the main process to finish creating the cache.
-        # This is a blocking call.
-        dist.barrier()
+        # This flag is used for the pre-flight check before DDP starts
+        if create_cache:
+            self._create_cache(root_dir, transform, self.cache_path)
+            return
 
-        # After the barrier, all non-main processes load the now-guaranteed-to-exist cache.
-        if not is_main_process():
-            cached_data = torch.load(cache_path, map_location='cpu')
-            self.images = cached_data['images']
-            self.annotations = cached_data['annotations']
+        # Regular initialization: just load the data from the guaranteed-to-exist cache
+        cached_data = torch.load(self.cache_path, map_location='cpu')
+        self.images = cached_data['images']
+        self.annotations = cached_data['annotations']
 
     def _create_cache(self, root_dir, transform, cache_path):
         """Logic for creating the cache, only run by the main process."""
@@ -332,6 +320,7 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
     
     use_preload = available_ram_gb > RAM_THRESHOLD_GB
     if use_preload:
+        # Now this just loads the data from the pre-existing cache
         dataset = VisDroneDatasetPreload(root_dir=DATASET_PATH, transform=transform)
     else:
         if is_main_process(): console.print(f"💾 [magenta]Using memory-safe on-demand disk loading strategy.[/magenta]")
@@ -478,19 +467,6 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
 
 
 def main():
-    # This message will now print from the main process as soon as the script is invoked.
-    # It runs before DDP setup, ensuring the user gets immediate feedback.
-    if int(os.environ.get("RANK", 0)) == 0:
-        console.print(Panel(
-            "[bold yellow]Script Initializing...[/bold yellow]\n\n"
-            "Welcome! The script is starting up. Please be patient.\n\n"
-            "• [bold]First-time run:[/bold] The script will cache the entire dataset. This is a one-time operation that can take [cyan]10-30+ minutes[/cyan] depending on your storage speed. A progress bar will be displayed below.\n"
-            "• [bold]Subsequent runs:[/bold] Startup will be much faster as the script will load the cached dataset.",
-            title="[bold magenta]Startup Information[/bold magenta]",
-            border_style="magenta",
-            expand=False
-        ))
-
     parser = argparse.ArgumentParser(description="Distributed training of adversarial patches using DDP.")
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume a specific run.')
     parser.add_argument('--starter_image', type=str, default=None, help='Path to an image to use as the starting point for the patch.')
@@ -502,14 +478,36 @@ def main():
 
     args = parser.parse_args()
 
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    
-    setup_ddp(rank, world_size)
-    
-    # Only the main process should print verbose status messages
-    if is_main_process():
-        print(f"[INFO] DDP setup complete for {world_size} processes. Main process (Rank 0) is running on CUDA device: {torch.cuda.current_device()}", flush=True)
+    # This environment variable is set by torchrun. Default to 0 if not set (for single-process debugging).
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    # --- Pre-flight check for dataset cache (run by main process ONLY) ---
+    if rank == 0:
+        console.print(Panel(
+            "[bold yellow]Script Initializing...[/bold yellow]\n\n"
+            "Welcome! The script is starting up. Please be patient.\n\n"
+            "• [bold]First-time run:[/bold] The script will cache the entire dataset. This is a one-time operation that can take [cyan]10-30+ minutes[/cyan] depending on your storage speed. A progress bar will be displayed below.\n"
+            "• [bold]Subsequent runs:[/bold] Startup will be much faster as the script will load the cached dataset.",
+            title="[bold magenta]Startup Information[/bold magenta]",
+            border_style="magenta",
+            expand=False
+        ))
+        
+        available_ram_gb = psutil.virtual_memory().available / (1024 ** 3)
+        if available_ram_gb > RAM_THRESHOLD_GB:
+            cache_path = os.path.join(DATASET_PATH, CACHE_FILE)
+            if not os.path.exists(cache_path):
+                # This creates a temporary instance just to trigger the caching logic.
+                transform = T.Compose([T.Resize((640, 640)), T.ToTensor()])
+                VisDroneDatasetPreload(root_dir=DATASET_PATH, transform=transform, create_cache=True)
+
+    # If running in a distributed setting, initialize the process group
+    is_distributed = world_size > 1
+    if is_distributed:
+        setup_ddp(rank, world_size)
+        if is_main_process():
+            print(f"[INFO] DDP setup complete for {world_size} processes. Main process (Rank 0) is running on CUDA device: {torch.cuda.current_device()}", flush=True)
 
     try:
         if is_main_process():
@@ -545,12 +543,12 @@ def main():
                 del temp_model
                 torch.cuda.empty_cache()
         
-        batch_size_tensor = torch.tensor([final_batch_size], dtype=torch.int64).to(rank)
-        dist.broadcast(batch_size_tensor, src=0)
-        final_batch_size = batch_size_tensor.item()
-        if is_main_process():
-             print(f"[INFO] Determined and broadcasted batch size: {final_batch_size}", flush=True)
-
+        if is_distributed:
+            batch_size_tensor = torch.tensor([final_batch_size], dtype=torch.int64).to(rank)
+            dist.broadcast(batch_size_tensor, src=0)
+            final_batch_size = batch_size_tensor.item()
+            if is_main_process():
+                 print(f"[INFO] Determined and broadcasted batch size: {final_batch_size}", flush=True)
 
         effective_batch_size = final_batch_size * world_size
         scaled_lr = BASE_LEARNING_RATE * math.sqrt(effective_batch_size / BASE_BATCH_SIZE)
@@ -562,9 +560,10 @@ def main():
             if args.resume: log_dir = os.path.dirname(args.resume)
             os.makedirs(log_dir, exist_ok=True)
         
-        log_dir_list = [log_dir]
-        dist.broadcast_object_list(log_dir_list, src=0)
-        log_dir = log_dir_list[0]
+        if is_distributed:
+            log_dir_list = [log_dir]
+            dist.broadcast_object_list(log_dir_list, src=0)
+            log_dir = log_dir_list[0]
 
         if is_main_process():
             console.print("✅ [green]Setup complete. Starting training loop...[/green]")
@@ -582,9 +581,10 @@ def main():
         print(f"[ERROR - Rank {rank}] Encountered an exception: {e}", flush=True)
         traceback.print_exc()
     finally:
-        if is_main_process():
-            print(f"[INFO] Main process (Rank 0) cleaning up DDP.", flush=True)
-        cleanup_ddp()
+        if is_distributed:
+            if is_main_process():
+                print(f"[INFO] Main process (Rank 0) cleaning up DDP.", flush=True)
+            cleanup_ddp()
 
 if __name__ == '__main__':
     mp.set_start_method('spawn', force=True) 
