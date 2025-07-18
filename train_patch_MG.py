@@ -44,6 +44,7 @@ from datetime import datetime
 import math
 import signal
 import psutil
+import logging
 
 # --- Rich CLI Components for a clean UI ---
 from rich.console import Console
@@ -52,6 +53,7 @@ from rich.live import Live
 from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, MofNCompleteColumn
 from rich.layout import Layout
 from rich.panel import Panel
+from rich.logging import RichHandler
 
 # --- Kornia for GPU-accelerated augmentations ---
 import kornia.augmentation as K
@@ -110,7 +112,7 @@ class VisDroneDatasetLazy(Dataset):
         self.annotation_dir = os.path.join(root_dir, 'annotations_v11')
         self.image_files = sorted(os.listdir(self.image_dir))
         if is_main_process():
-            console.print(f"✅ [green]Lazy Dataset initialized. Found {len(self.image_files)} images.[/green]")
+            logging.info(f"Lazy Dataset initialized. Found {len(self.image_files)} images.")
 
     def __len__(self):
         return len(self.image_files)
@@ -161,7 +163,7 @@ class VisDroneDatasetPreload(Dataset):
 
     def _create_cache(self, root_dir, transform, cache_path):
         """Logic for creating the cache, only run by the main process."""
-        console.print(f"⏳ [magenta]No cache found. Starting pre-processing of dataset.[/magenta]")
+        logging.info("No cache found. Starting pre-processing of dataset.")
         self.images = []
         self.annotations = []
         image_dir = os.path.join(root_dir, 'images')
@@ -210,12 +212,12 @@ class VisDroneDatasetPreload(Dataset):
                     boxes_tensor[:, [1, 3]] *= scale_y
                 self.annotations.append(boxes_tensor)
         
-        console.print(f"💾 [blue]Caching complete. Saving to {cache_path}...[/blue]")
+        logging.info(f"Caching complete. Saving to {cache_path}...")
         try:
             torch.save({'images': self.images, 'annotations': self.annotations}, cache_path)
-            console.print(f"✅ [green]Dataset cached successfully.[/green]")
+            logging.info("Dataset cached successfully.")
         except Exception as e:
-            console.print(f"⚠️ [red]Could not save cache file: {e}[/red]")
+            logging.error(f"Could not save cache file: {e}")
 
     def __len__(self):
         return len(self.images)
@@ -237,10 +239,10 @@ class TotalVariationLoss(torch.nn.Module):
 
 def autotune_batch_size(device, model, dataset_len, initial_batch_size=2):
     batch_size = initial_batch_size
-    console.print(f"🚀 [magenta]Starting BATCH SIZE autotune (for a single GPU) from size {batch_size}...[/magenta]")
+    logging.info(f"Starting BATCH SIZE autotune (for a single GPU) from size {batch_size}...")
     while True:
         if batch_size > dataset_len:
-            console.print(f"✅ [green]Batch size ({batch_size}) exceeds dataset size. Using previous valid size.[/green]")
+            logging.info(f"Batch size ({batch_size}) exceeds dataset size. Using previous valid size.")
             return batch_size // 2
         try:
             dummy_data = DummyDataset(length=batch_size)
@@ -252,17 +254,17 @@ def autotune_batch_size(device, model, dataset_len, initial_batch_size=2):
                 output = model(images)
                 dummy_loss = output[0].sum()
             dummy_loss.backward()
-            console.print(f"✅ [green]Batch size {batch_size} fits in memory. Trying next size...[/green]")
+            logging.info(f"Batch size {batch_size} fits in memory. Trying next size...")
             del images, dataloader, output, dummy_loss
             batch_size *= 2
             torch.cuda.empty_cache()
         except torch.cuda.OutOfMemoryError:
             max_size = batch_size // 2
-            console.print(f"⚠️ [yellow]OOM at batch size {batch_size}. Optimal per-GPU batch size set to: {max_size}[/yellow]")
+            logging.warning(f"OOM at batch size {batch_size}. Optimal per-GPU batch size set to: {max_size}")
             torch.cuda.empty_cache()
             return max(1, max_size)
         except StopIteration:
-            console.print(f"✅ [green]Batch size {batch_size} fits, but dataset is too small to double.[/green]")
+            logging.info(f"Batch size {batch_size} fits, but dataset is too small to double.")
             return batch_size
 
 def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, log_dir):
@@ -287,18 +289,18 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
             model.model.module = model_to_compile
         else:
             model.model = model_to_compile
-        if is_main_process(): console.print("✅ [green]Model compiled successfully with torch.compile().[/green]")
+        if is_main_process(): logging.info("Model compiled successfully with torch.compile().")
     except Exception as e:
-        if is_main_process(): console.print(f"⚠️ [yellow]torch.compile() failed: {e}. Running without compilation.[/yellow]")
+        if is_main_process(): logging.warning(f"torch.compile() failed: {e}. Running without compilation.")
 
     if args.starter_image and os.path.exists(args.starter_image):
-        if is_main_process(): console.print(f"🌱 [cyan]Initializing patch from starter image: {args.starter_image}[/cyan]")
+        if is_main_process(): logging.info(f"Initializing patch from starter image: {args.starter_image}")
         starter_image = Image.open(args.starter_image).convert("RGB")
         transform_starter = T.Compose([T.Resize((PATCH_SIZE, PATCH_SIZE)), T.ToTensor()])
         adversarial_patch = transform_starter(starter_image).to(device, non_blocking=True)
         adversarial_patch.requires_grad_(True)
     else:
-        if is_main_process(): console.print(f"🎨 [cyan]Initializing patch with random noise.[/cyan]")
+        if is_main_process(): logging.info("Initializing patch with random noise.")
         adversarial_patch = torch.rand((3, PATCH_SIZE, PATCH_SIZE), device=device, requires_grad=True)
 
     optimizer = torch.optim.Adam([adversarial_patch], lr=learning_rate, amsgrad=True)
@@ -308,7 +310,7 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
     start_epoch = 0
 
     if args.resume and os.path.exists(args.resume):
-        if is_main_process(): console.print(f"🔄 [blue]Resuming training from checkpoint: {args.resume}[/blue]")
+        if is_main_process(): logging.info(f"Resuming training from checkpoint: {args.resume}")
         checkpoint = torch.load(args.resume, map_location=f'cuda:{rank}')
         model_to_load = model.model.module if is_distributed else model.model
         model_to_load.load_state_dict(checkpoint['model_state_dict'])
@@ -317,7 +319,7 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
         if 'scaler_state_dict' in checkpoint: scaler.load_state_dict(checkpoint['scaler_state_dict'])
         if 'scheduler_state_dict' in checkpoint: scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         start_epoch = checkpoint['epoch']
-        if is_main_process(): console.print(f"Resumed from epoch {start_epoch}.")
+        if is_main_process(): logging.info(f"Resumed from epoch {start_epoch}.")
 
     patch_augmentations = torch.nn.Sequential(
         K.RandomAffine(degrees=(-15, 15), scale=(0.8, 1.2), p=1.0),
@@ -332,7 +334,7 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
     if use_preload:
         dataset = VisDroneDatasetPreload(root_dir=DATASET_PATH, transform=transform)
     else:
-        if is_main_process(): console.print(f"💾 [magenta]Using memory-safe on-demand disk loading strategy.[/magenta]")
+        if is_main_process(): logging.info("Using memory-safe on-demand disk loading strategy.")
         dataset = VisDroneDatasetLazy(root_dir=DATASET_PATH, transform=transform)
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if is_distributed else None
@@ -478,6 +480,47 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
     if is_main_process() and writer: writer.close()
 
 
+def setup_logging(log_dir, rank):
+    """Configures logging to file and console."""
+    log_format = "%(asctime)s - %(levelname)s - [Rank %(rank)s] - %(message)s"
+    
+    # Root logger
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+
+    # File handler - only for the main process to avoid file write conflicts
+    if rank == 0:
+        os.makedirs(log_dir, exist_ok=True)
+        file_handler = logging.FileHandler(os.path.join(log_dir, "training.log"))
+        file_handler.setLevel(logging.DEBUG)
+        file_formatter = logging.Formatter(log_format)
+        file_handler.setFormatter(file_formatter)
+        logger.addHandler(file_handler)
+
+    # Rich handler for console output - only for the main process
+    if rank == 0:
+        rich_handler = RichHandler(console=console, rich_tracebacks=True, show_path=False)
+        rich_handler.setLevel(logging.INFO)
+        logger.addHandler(rich_handler)
+    else:
+        # Other processes can log to a null handler to avoid output clutter
+        logger.addHandler(logging.NullHandler())
+
+    # Custom adapter to add rank to log records
+    class RankAdapter(logging.LoggerAdapter):
+        def process(self, msg, kwargs):
+            return '[Rank %s] %s' % (self.extra['rank'], msg), kwargs
+
+    logger = RankAdapter(logger, {'rank': rank})
+    return logger
+
+def handle_exception(exc_type, exc_value, exc_traceback):
+    """Global exception hook to log unhandled exceptions."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    logging.error("Unhandled exception", exc_info=(exc_type, exc_value, exc_traceback))
+
 def main():
     parser = argparse.ArgumentParser(description="Distributed training of adversarial patches using DDP.")
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume a specific run.')
@@ -494,17 +537,39 @@ def main():
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
+    # --- Setup Logging and Exception Hook ---
+    # The log directory is determined before DDP setup so the log file is ready.
+    log_dir = None
+    if rank == 0:
+        session_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_dir_base = "runs"
+        log_dir = os.path.join(log_dir_base, session_timestamp)
+        if args.resume:
+            log_dir = os.path.dirname(args.resume)
+        os.makedirs(log_dir, exist_ok=True)
+    
+    # Broadcast the log_dir to all processes
+    log_dir_list = [log_dir]
+    if world_size > 1:
+        # Temporarily initialize a basic process group just for this broadcast
+        # This is a workaround to share the log_dir before the main DDP setup
+        try:
+            dist.init_process_group("gloo", rank=rank, world_size=world_size, timeout=datetime.timedelta(seconds=20))
+            dist.broadcast_object_list(log_dir_list, src=0)
+            dist.destroy_process_group()
+        except Exception as e:
+            if rank == 0:
+                console.print(f"[bold red]Could not broadcast log directory. Each process will log separately. Error: {e}[/bold red]")
+    log_dir = log_dir_list[0]
+
+    setup_logging(log_dir, rank)
+    sys.excepthook = handle_exception
+
     # --- Pre-flight check for dataset cache (run by main process ONLY) ---
     if rank == 0:
-        console.print(Panel(
-            "[bold yellow]Script Initializing...[/bold yellow]\n\n"
-            "Welcome! The script is starting up. Please be patient.\n\n"
-            "• [bold]First-time run:[/bold] The script will cache the entire dataset. This is a one-time operation that can take [cyan]10-30+ minutes[/cyan] depending on your storage speed. A progress bar will be displayed below.\n"
-            "• [bold]Subsequent runs:[/bold] Startup will be much faster as the script will load the cached dataset.",
-            title="[bold magenta]Startup Information[/bold magenta]",
-            border_style="magenta",
-            expand=False
-        ))
+        logging.info("Script Initializing...")
+        logging.info("First-time run: The script will cache the entire dataset. This can take 10-30+ minutes. A progress bar will be displayed.")
+        logging.info("Subsequent runs: Startup will be much faster.")
         
         available_ram_gb = psutil.virtual_memory().available / (1024 ** 3)
         if available_ram_gb > RAM_THRESHOLD_GB:
@@ -519,36 +584,35 @@ def main():
     if is_distributed:
         setup_ddp(rank, world_size)
         if is_main_process():
-            print(f"[INFO] DDP setup complete for {world_size} processes. Main process (Rank 0) is running on CUDA device: {torch.cuda.current_device()}", flush=True)
+            logging.info(f"DDP setup complete for {world_size} processes. Main process (Rank 0) is running on CUDA device: {torch.cuda.current_device()}")
 
     try:
         if is_main_process():
-            parent_log_dir = "runs"
-            os.makedirs(parent_log_dir, exist_ok=True)
             try:
                 tb = program.TensorBoard()
-                tb.configure(argv=[None, '--logdir', parent_log_dir])
+                tb.configure(argv=[None, '--logdir', "runs"])
                 url = tb.launch()
                 console.print(Panel(f"🔌 [bold]TensorBoard is running: [link={url}]{url}[/link][/bold]", title="TensorBoard", border_style="blue"))
             except Exception as e:
-                console.print(f"⚠️ [yellow]Could not launch TensorBoard: {e}[/yellow]")
+                logging.warning(f"Could not launch TensorBoard: {e}")
             if args.starter_image and args.resume: 
-                console.print(f"[red]Error: --starter_image and --resume cannot be used together.[/red]"); sys.exit(1)
+                logging.error("Error: --starter_image and --resume cannot be used together.")
+                sys.exit(1)
         
         temp_dataset_len = len(os.listdir(os.path.join(DATASET_PATH, 'images')))
         
         final_batch_size = 0
         if args.batch_size:
             final_batch_size = args.batch_size
-            if is_main_process(): console.print(f"✅ [green]Using user-provided per-GPU batch size: {final_batch_size}[/green]")
+            if is_main_process(): logging.info(f"Using user-provided per-GPU batch size: {final_batch_size}")
         elif args.resume:
             if is_main_process():
                 checkpoint = torch.load(args.resume, map_location='cpu')
                 final_batch_size = checkpoint.get('batch_size', BASE_BATCH_SIZE)
-                console.print(f"Resuming with batch size {final_batch_size} from checkpoint.")
+                logging.info(f"Resuming with batch size {final_batch_size} from checkpoint.")
         else:
             if is_main_process():
-                console.print(f"🛠️ [magenta]Starting batch size autotune on Rank 0...[/magenta]")
+                logging.info("Starting batch size autotune on Rank 0...")
                 temp_model = YOLO(MODEL_NAME).to(rank)
                 # Pass the underlying model.model to the autotuner
                 final_batch_size = autotune_batch_size(device=rank, model=temp_model.model, dataset_len=temp_dataset_len)
@@ -560,42 +624,23 @@ def main():
             dist.broadcast(batch_size_tensor, src=0)
             final_batch_size = batch_size_tensor.item()
             if is_main_process():
-                 print(f"[INFO] Determined and broadcasted batch size: {final_batch_size}", flush=True)
+                 logging.info(f"Determined and broadcasted batch size: {final_batch_size}")
 
         effective_batch_size = final_batch_size * world_size
         scaled_lr = BASE_LEARNING_RATE * math.sqrt(effective_batch_size / BASE_BATCH_SIZE)
         
-        log_dir = None
         if is_main_process():
-            session_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            log_dir = os.path.join("runs", session_timestamp)
-            if args.resume: log_dir = os.path.dirname(args.resume)
-            os.makedirs(log_dir, exist_ok=True)
-        
-        if is_distributed:
-            log_dir_list = [log_dir]
-            dist.broadcast_object_list(log_dir_list, src=0)
-            log_dir = log_dir_list[0]
-
-        if is_main_process():
-            console.print("✅ [green]Setup complete. Starting training loop...[/green]")
+            logging.info("Setup complete. Starting training loop...")
 
         train_adversarial_patch(rank, world_size, args, final_batch_size, scaled_lr, log_dir)
 
     except Exception as e:
-        if is_main_process():
-            console.print("\n" + "="*60)
-            console.print(f"💥 [bold red]An unexpected error occurred![/bold red]")
-            console.print("="*60)
-            error_info = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-            console.print(error_info)
-        # Ensure all processes see the error and exit
-        print(f"[ERROR - Rank {rank}] Encountered an exception: {e}", flush=True)
-        traceback.print_exc()
+        logging.critical("A critical error occurred in the main execution block.", exc_info=True)
+        # The sys.excepthook will also catch this, but logging it here provides context.
     finally:
         if is_distributed:
             if is_main_process():
-                print(f"[INFO] Main process (Rank 0) cleaning up DDP.", flush=True)
+                logging.info("Main process (Rank 0) cleaning up DDP.")
             cleanup_ddp()
 
 if __name__ == '__main__':
