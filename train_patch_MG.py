@@ -356,100 +356,139 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
     epoch_results = []
     best_loss_epoch = -1
 
-    for epoch in range(start_epoch, args.max_epochs):
-        if is_distributed:
-            sampler.set_epoch(epoch)
-        
-        task_id = progress.add_task(f"Epoch {epoch + 1}", total=len(dataloader)) if is_main_process() else None
+    # --- Graceful Shutdown and Early Stopping Handling ---
+    shutdown_signal = torch.tensor([0], dtype=torch.int, device=device)
+    epoch = start_epoch # Initialize epoch for the final save logic
 
-        for i, batch_data in enumerate(dataloader):
-            if batch_data is None:
+    try:
+        for epoch in range(start_epoch, args.max_epochs):
+            # Synchronize shutdown signal across all processes at the start of each epoch
+            if is_distributed:
+                dist.all_reduce(shutdown_signal, op=dist.ReduceOp.MAX)
+            
+            # If any process has signaled a shutdown, break the loop
+            if shutdown_signal.item() == 1:
+                if is_main_process():
+                    console.print("\n[bold yellow]Shutdown signal received. Stopping training.[/bold yellow]")
+                break
+            
+            if is_distributed:
+                sampler.set_epoch(epoch)
+            
+            task_id = progress.add_task(f"Epoch {epoch + 1}", total=len(dataloader)) if is_main_process() else None
+
+            for i, batch_data in enumerate(dataloader):
+                if batch_data is None:
+                    if is_main_process(): progress.update(task_id, advance=1)
+                    continue
+                images, gt_boxes_batch = batch_data
+                images = images.to(device, non_blocking=True)
+                current_batch_size = images.size(0)
+                
+                patch_batch = adversarial_patch.unsqueeze(0).repeat(current_batch_size, 1, 1, 1)
+                transformed_patch_batch = patch_augmentations(patch_batch)
+                transformed_patch_batch.data.clamp_(0, 1)
+
+                for img_idx in range(current_batch_size):
+                    gt_boxes = gt_boxes_batch[img_idx]
+                    if len(gt_boxes) > 0:
+                        box = gt_boxes[random.randint(0, len(gt_boxes) - 1)].int()
+                        box[0], box[1] = max(0, box[0]), max(0, box[1])
+                        box[2], box[3] = min(images.shape[3] - 1, box[2]), min(images.shape[2] - 1, box[3])
+                        center_x = random.randint(box[0], box[2]) if box[2] > box[0] else images.shape[3] // 2
+                        center_y = random.randint(box[1], box[3]) if box[3] > box[1] else images.shape[2] // 2
+                        patch_x = max(0, min(center_x - PATCH_SIZE // 2, images.shape[3] - PATCH_SIZE))
+                        patch_y = max(0, min(center_y - PATCH_SIZE // 2, images.shape[2] - PATCH_SIZE))
+                        images[img_idx, :, patch_y:patch_y+PATCH_SIZE, patch_x:patch_x+PATCH_SIZE] = transformed_patch_batch[img_idx]
+                    else:
+                        x_start, y_start = random.randint(0, 640 - PATCH_SIZE), random.randint(0, 640 - PATCH_SIZE)
+                        images[img_idx, :, y_start:y_start+PATCH_SIZE, x_start:x_start+PATCH_SIZE] = transformed_patch_batch[img_idx]
+
+                optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast(device_type='cuda'):
+                    raw_preds = model(images)[0].transpose(1, 2)
+                    adv_loss = -torch.mean(torch.max(raw_preds[..., 4:], dim=-1)[0])
+                    tv_loss = total_variation(adversarial_patch)
+                    total_loss = adv_loss + args.tv_weight * tv_loss
+
+                scaler.scale(total_loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                adversarial_patch.data.clamp_(0, 1)
+                
                 if is_main_process(): progress.update(task_id, advance=1)
-                continue
-            images, gt_boxes_batch = batch_data
-            images = images.to(device, non_blocking=True)
-            current_batch_size = images.size(0)
-            
-            patch_batch = adversarial_patch.unsqueeze(0).repeat(current_batch_size, 1, 1, 1)
-            transformed_patch_batch = patch_augmentations(patch_batch)
-            transformed_patch_batch.data.clamp_(0, 1)
 
-            for img_idx in range(current_batch_size):
-                gt_boxes = gt_boxes_batch[img_idx]
-                if len(gt_boxes) > 0:
-                    box = gt_boxes[random.randint(0, len(gt_boxes) - 1)].int()
-                    box[0], box[1] = max(0, box[0]), max(0, box[1])
-                    box[2], box[3] = min(images.shape[3] - 1, box[2]), min(images.shape[2] - 1, box[3])
-                    center_x = random.randint(box[0], box[2]) if box[2] > box[0] else images.shape[3] // 2
-                    center_y = random.randint(box[1], box[3]) if box[3] > box[1] else images.shape[2] // 2
-                    patch_x = max(0, min(center_x - PATCH_SIZE // 2, images.shape[3] - PATCH_SIZE))
-                    patch_y = max(0, min(center_y - PATCH_SIZE // 2, images.shape[2] - PATCH_SIZE))
-                    images[img_idx, :, patch_y:patch_y+PATCH_SIZE, patch_x:patch_x+PATCH_SIZE] = transformed_patch_batch[img_idx]
+            if is_main_process():
+                progress.remove_task(task_id)
+                
+                total_loss_tensor = torch.tensor(total_loss.item()).to(device)
+                if is_distributed:
+                    dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.AVG)
+                avg_total_loss = total_loss_tensor.item()
+                
+                if avg_total_loss < best_loss:
+                    best_loss = avg_total_loss
+                    epochs_no_improve = 0
+                    best_loss_epoch = epoch + 1
+                    unwrapped_model = model.module if is_distributed else model
+                    unwrapped_model = unwrapped_model.module if hasattr(unwrapped_model, 'module') else unwrapped_model
+                    save_dict = { 'epoch': epoch + 1, 'model_state_dict': unwrapped_model.state_dict(), 'patch_state_dict': adversarial_patch.data.clone(), 'optimizer_state_dict': optimizer.state_dict(), 'scaler_state_dict': scaler.state_dict(), 'scheduler_state_dict': scheduler.state_dict(), 'batch_size': batch_size }
+                    torch.save(save_dict, os.path.join(log_dir, BEST_CHECKPOINT_FILE))
+                    T.ToPILImage()(adversarial_patch.cpu()).save(os.path.join(log_dir, "best_patch.png"))
                 else:
-                    x_start, y_start = random.randint(0, 640 - PATCH_SIZE), random.randint(0, 640 - PATCH_SIZE)
-                    images[img_idx, :, y_start:y_start+PATCH_SIZE, x_start:x_start+PATCH_SIZE] = transformed_patch_batch[img_idx]
+                    epochs_no_improve += 1
+                
+                epoch_results.append({"epoch": epoch + 1, "total_loss": avg_total_loss, "lr": optimizer.param_groups[0]['lr'], "patience": f"{epochs_no_improve}/{args.early_stopping_patience}"})
+                
+                results_table = Table(title="Epoch Results", expand=True, border_style="blue")
+                results_table.add_column("Epoch", justify="right", style="cyan"); results_table.add_column("Total Loss", style="bold red"); results_table.add_column("LR", style="cyan"); results_table.add_column("Patience", style="blue")
+                for result in epoch_results[-40:]:
+                    row_style = "bold green" if result["epoch"] == best_loss_epoch else ""
+                    results_table.add_row(f"{result['epoch']}", f"{result['total_loss']:.4f}", f"{result['lr']:.1e}", result['patience'], style=row_style)
+                layout["table"].update(Panel(results_table, title="[blue]Training Log (Recent Epochs)[/blue]", border_style="blue"))
+                
+                scheduler.step(avg_total_loss)
+                writer.add_scalar('Loss/Total', avg_total_loss, epoch); writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch); writer.add_image('Adversarial Patch', adversarial_patch, epoch)
+                
+                if epochs_no_improve >= args.early_stopping_patience:
+                    console.print(f"\n🛑 [bold red]Early stopping triggered after {args.early_stopping_patience} epochs with no improvement.[/bold red]")
+                    shutdown_signal[0] = 1
 
-            optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type='cuda'):
-                raw_preds = model(images)[0].transpose(1, 2)
-                adv_loss = -torch.mean(torch.max(raw_preds[..., 4:], dim=-1)[0])
-                tv_loss = total_variation(adversarial_patch)
-                total_loss = adv_loss + args.tv_weight * tv_loss
-
-            scaler.scale(total_loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            adversarial_patch.data.clamp_(0, 1)
-            
-            if is_main_process(): progress.update(task_id, advance=1)
-
+    except KeyboardInterrupt:
+        shutdown_signal[0] = 1
         if is_main_process():
-            progress.remove_task(task_id)
-            
-            total_loss_tensor = torch.tensor(total_loss.item()).to(device)
-            if is_distributed:
-                dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.AVG)
-            avg_total_loss = total_loss_tensor.item()
-            
-            if avg_total_loss < best_loss:
-                best_loss = avg_total_loss
-                epochs_no_improve = 0
-                best_loss_epoch = epoch + 1
-                unwrapped_model = model.module if is_distributed else model
-                unwrapped_model = unwrapped_model.module if hasattr(unwrapped_model, 'module') else unwrapped_model
-                save_dict = { 'epoch': epoch + 1, 'model_state_dict': unwrapped_model.state_dict(), 'patch_state_dict': adversarial_patch.data.clone(), 'optimizer_state_dict': optimizer.state_dict(), 'scaler_state_dict': scaler.state_dict(), 'scheduler_state_dict': scheduler.state_dict(), 'batch_size': batch_size }
-                torch.save(save_dict, os.path.join(log_dir, BEST_CHECKPOINT_FILE))
-                T.ToPILImage()(adversarial_patch.cpu()).save(os.path.join(log_dir, "best_patch.png"))
-            else:
-                epochs_no_improve += 1
-            
-            epoch_results.append({"epoch": epoch + 1, "total_loss": avg_total_loss, "lr": optimizer.param_groups[0]['lr'], "patience": f"{epochs_no_improve}/{args.early_stopping_patience}"})
-            
-            results_table = Table(title="Epoch Results", expand=True, border_style="blue")
-            results_table.add_column("Epoch", justify="right", style="cyan"); results_table.add_column("Total Loss", style="bold red"); results_table.add_column("LR", style="cyan"); results_table.add_column("Patience", style="blue")
-            for result in epoch_results[-40:]:
-                row_style = "bold green" if result["epoch"] == best_loss_epoch else ""
-                results_table.add_row(f"{result['epoch']}", f"{result['total_loss']:.4f}", f"{result['lr']:.1e}", result['patience'], style=row_style)
-            layout["table"].update(Panel(results_table, title="[blue]Training Log (Recent Epochs)[/blue]", border_style="blue"))
-            
-            scheduler.step(avg_total_loss)
-            writer.add_scalar('Loss/Total', avg_total_loss, epoch); writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch); writer.add_image('Adversarial Patch', adversarial_patch, epoch)
-            
-            stop_signal = torch.tensor([0]).to(device)
-            if epochs_no_improve >= args.early_stopping_patience:
-                if live: live.stop()
-                console.print(f"\n🛑 [bold red]Early stopping triggered after {args.early_stopping_patience} epochs with no improvement.[/bold red]")
-                stop_signal = torch.tensor([1]).to(device)
-            if is_distributed:
-                dist.broadcast(stop_signal, src=0)
-            if stop_signal.item() == 1: break
-        elif is_distributed:
-            stop_signal = torch.tensor([0]).to(device)
-            dist.broadcast(stop_signal, src=0)
-            if stop_signal.item() == 1: break
+            console.print("\n\n[bold red]Ctrl+C detected! Initiating graceful shutdown...[/bold red]")
+    
+    finally:
+        # This block will execute on all processes after the loop finishes or after an interrupt.
+        if is_main_process() and live:
+            live.stop()
 
-    if is_main_process() and live: live.stop()
-    if is_main_process() and writer: writer.close()
+        # Synchronize all processes and ensure everyone knows about the shutdown.
+        if is_distributed:
+            dist.all_reduce(shutdown_signal, op=dist.ReduceOp.MAX)
+            dist.barrier()
+
+        # Main process saves the final checkpoint if a shutdown was signaled.
+        if is_main_process() and shutdown_signal.item() == 1:
+            console.print("[yellow]Saving final checkpoint before exiting...[/yellow]")
+            unwrapped_model = model.module if is_distributed else model
+            unwrapped_model = unwrapped_model.module if hasattr(unwrapped_model, 'module') else unwrapped_model
+            save_dict = {
+                'epoch': epoch + 1, # Save the next epoch number to resume from
+                'model_state_dict': unwrapped_model.state_dict(),
+                'patch_state_dict': adversarial_patch.data.clone(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scaler_state_dict': scaler.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'batch_size': batch_size
+            }
+            final_checkpoint_path = os.path.join(log_dir, "interrupt_checkpoint.pth")
+            torch.save(save_dict, final_checkpoint_path)
+            console.print(f"[green]Final checkpoint saved to {final_checkpoint_path}[/green]")
+
+        if is_main_process() and writer:
+            writer.close()
 
 
 def setup_logging(log_dir, rank):
