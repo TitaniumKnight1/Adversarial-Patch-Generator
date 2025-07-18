@@ -73,7 +73,6 @@ CACHE_FILE = "preprocessed_dataset.pth"
 RAM_THRESHOLD_GB = 64 # Increased threshold for powerful servers
 
 # --- Initialize Rich Console ---
-# We create a global console, but only the main process will use the rich features.
 console = Console()
 
 # --- DDP Helper Functions ---
@@ -81,7 +80,6 @@ def setup_ddp(rank, world_size):
     """Initializes the distributed process group."""
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355' # A free port
-    # NCCL is the standard backend for GPU-based distributed training
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
@@ -154,7 +152,7 @@ class VisDroneDatasetPreload(Dataset):
             if os.path.exists(cache_path):
                 console.print(f"✅ [Rank {rank}] Main process found existing cache. Loading from: {cache_path}")
                 try:
-                    cached_data = torch.load(cache_path, map_location='cpu') # Load to CPU first
+                    cached_data = torch.load(cache_path, map_location='cpu')
                     self.images = cached_data['images']
                     self.annotations = cached_data['annotations']
                     console.print(f"✅ [Rank {rank}] Cached dataset loaded successfully. {len(self.images)} items in memory.")
@@ -164,19 +162,18 @@ class VisDroneDatasetPreload(Dataset):
             else:
                 self._create_cache(root_dir, transform, cache_path)
         
-        # --- DEBUG LOGGING ---
         # All processes will wait here until the main process is done creating the cache.
-        print(f"[INFO - Rank {rank}] Reached barrier, waiting for all processes...")
+        print(f"[INFO - Rank {rank}] Reached barrier, waiting for cache creation...", flush=True)
         dist.barrier()
-        print(f"[INFO - Rank {rank}] Passed barrier.")
+        print(f"[INFO - Rank {rank}] Passed barrier. Cache is ready.", flush=True)
 
         # All processes load from the now-guaranteed-to-exist cache
         if not is_main_process():
-            print(f"[INFO - Rank {rank}] Loading dataset from cache: {cache_path}")
+            print(f"[INFO - Rank {rank}] Loading dataset from cache: {cache_path}", flush=True)
             cached_data = torch.load(cache_path, map_location='cpu')
             self.images = cached_data['images']
             self.annotations = cached_data['annotations']
-            print(f"[INFO - Rank {rank}] Successfully loaded {len(self.images)} items from cache.")
+            print(f"[INFO - Rank {rank}] Successfully loaded {len(self.images)} items from cache.", flush=True)
 
     def _create_cache(self, root_dir, transform, cache_path):
         """Logic for creating the cache, only run by the main process."""
@@ -312,7 +309,6 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
     if args.resume and os.path.exists(args.resume):
         if is_main_process(): console.print(f"🔄 [blue]Resuming training from checkpoint: {args.resume}[/blue]")
         checkpoint = torch.load(args.resume, map_location=f'cuda:{rank}')
-        # When loading a checkpoint, you must load into the .module attribute of the DDP-wrapped model
         model.model.module.load_state_dict(checkpoint['model_state_dict'])
         adversarial_patch.data = checkpoint['patch_state_dict'].to(device)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -368,7 +364,7 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
     best_loss_epoch = -1
 
     for epoch in range(start_epoch, args.max_epochs):
-        sampler.set_epoch(epoch) # Crucial for proper shuffling in DDP
+        sampler.set_epoch(epoch)
         epoch_start_time = time.time()
         total_adv_loss, total_tv_loss = 0, 0
         
@@ -413,7 +409,6 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
             scaler.update()
             adversarial_patch.data.clamp_(0, 1)
             
-            # Aggregate losses from all GPUs for accurate logging
             dist.all_reduce(total_loss, op=dist.ReduceOp.AVG)
             dist.all_reduce(adv_loss, op=dist.ReduceOp.AVG)
             dist.all_reduce(tv_loss, op=dist.ReduceOp.AVG)
@@ -424,7 +419,6 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
 
         if is_main_process(): progress.remove_task(task_id)
         
-        # --- Epoch Summary (Main Process Only) ---
         if is_main_process():
             avg_adv_loss = total_adv_loss / len(dataloader)
             avg_tv_loss = total_tv_loss / len(dataloader)
@@ -436,7 +430,6 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
                 best_loss = avg_total_loss
                 epochs_no_improve = 0
                 best_loss_epoch = epoch + 1
-                # Save the raw model by accessing .module
                 unwrapped_model = model.module.module if hasattr(model.module, 'module') else model.module
                 save_dict = {
                     'epoch': epoch + 1, 
@@ -464,21 +457,17 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
             scheduler.step(avg_total_loss)
             writer.add_scalar('Loss/Adversarial', avg_adv_loss, epoch); writer.add_scalar('Loss/TotalVariation', avg_tv_loss, epoch); writer.add_scalar('Loss/Total', avg_total_loss, epoch); writer.add_scalar('Learning_Rate', current_lr, epoch); writer.add_image('Adversarial Patch', adversarial_patch, epoch)
             
+            stop_signal = torch.tensor([0]).to(device)
             if epochs_no_improve >= args.early_stopping_patience:
                 if live: live.stop()
                 console.print(f"\n🛑 [bold red]Early stopping triggered after {args.early_stopping_patience} epochs with no improvement.[/bold red]")
-                # Signal other processes to exit
                 stop_signal = torch.tensor([1]).to(device)
-            else:
-                stop_signal = torch.tensor([0]).to(device)
             dist.broadcast(stop_signal, src=0)
-            if stop_signal.item() == 1:
-                break
-        else: # Non-main processes check for stop signal
+            if stop_signal.item() == 1: break
+        else:
             stop_signal = torch.tensor([0]).to(device)
             dist.broadcast(stop_signal, src=0)
-            if stop_signal.item() == 1:
-                break
+            if stop_signal.item() == 1: break
 
     if is_main_process() and live: live.stop()
     if is_main_process() and writer: writer.close()
@@ -496,12 +485,11 @@ def main():
 
     args = parser.parse_args()
 
-    # DDP environment variables are set by torchrun
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     
     setup_ddp(rank, world_size)
-    print(f"[INFO - Rank {rank}/{world_size}] DDP setup complete. CUDA Device: {torch.cuda.current_device()}")
+    print(f"[INFO - Rank {rank}/{world_size}] DDP setup complete. CUDA Device: {torch.cuda.current_device()}", flush=True)
 
     try:
         if is_main_process():
@@ -519,13 +507,11 @@ def main():
         
         temp_dataset_len = len(os.listdir(os.path.join(DATASET_PATH, 'images')))
         
-        # --- Batch Size Determination ---
         final_batch_size = 0
         if args.batch_size:
             final_batch_size = args.batch_size
             if is_main_process(): console.print(f"✅ [green]Using user-provided per-GPU batch size: {final_batch_size}[/green]")
         elif args.resume:
-            # Only main process needs to read the file
             if is_main_process():
                 checkpoint = torch.load(args.resume, map_location='cpu')
                 final_batch_size = checkpoint.get('batch_size', BASE_BATCH_SIZE)
@@ -539,13 +525,11 @@ def main():
                 del temp_model
                 torch.cuda.empty_cache()
         
-        # Broadcast the determined batch size from the main process to all others
-        print(f"[INFO - Rank {rank}] Waiting to receive batch size...")
+        print(f"[INFO - Rank {rank}] Waiting to receive batch size...", flush=True)
         batch_size_tensor = torch.tensor([final_batch_size], dtype=torch.int64).to(rank)
         dist.broadcast(batch_size_tensor, src=0)
         final_batch_size = batch_size_tensor.item()
-        print(f"[INFO - Rank {rank}] Received batch size: {final_batch_size}")
-
+        print(f"[INFO - Rank {rank}] Received batch size: {final_batch_size}", flush=True)
 
         effective_batch_size = final_batch_size * world_size
         scaled_lr = BASE_LEARNING_RATE * math.sqrt(effective_batch_size / BASE_BATCH_SIZE)
@@ -557,7 +541,6 @@ def main():
             if args.resume: log_dir = os.path.dirname(args.resume)
             os.makedirs(log_dir, exist_ok=True)
         
-        # Broadcast log_dir to all processes
         log_dir_list = [log_dir]
         dist.broadcast_object_list(log_dir_list, src=0)
         log_dir = log_dir_list[0]
@@ -574,14 +557,12 @@ def main():
             console.print("="*60)
             error_info = "".join(traceback.format_exception(type(e), e, e.__traceback__))
             console.print(error_info)
-        # Ensure all processes see the error and exit
-        print(f"[ERROR - Rank {rank}] Encountered an exception: {e}")
+        print(f"[ERROR - Rank {rank}] Encountered an exception: {e}", flush=True)
         traceback.print_exc()
     finally:
-        print(f"[INFO - Rank {rank}] Cleaning up DDP.")
+        print(f"[INFO - Rank {rank}] Cleaning up DDP.", flush=True)
         cleanup_ddp()
 
 if __name__ == '__main__':
-    # Using 'spawn' is generally a good practice for CUDA multiprocessing applications
     mp.set_start_method('spawn', force=True) 
     main()
