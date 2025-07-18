@@ -1,6 +1,6 @@
 # =================================================================================================
 #           HIGH-PERFORMANCE DISTRIBUTED TRAINING SCRIPT (DDP)
-# =================================----------------================================================
+# =================================================================================================
 #
 # HOW TO RUN THIS SCRIPT:
 # -----------------------
@@ -73,6 +73,7 @@ CACHE_FILE = "preprocessed_dataset.pth"
 RAM_THRESHOLD_GB = 64 # Increased threshold for powerful servers
 
 # --- Initialize Rich Console ---
+# We create a global console, but only the main process will use the rich features.
 console = Console()
 
 # --- DDP Helper Functions ---
@@ -80,7 +81,9 @@ def setup_ddp(rank, world_size):
     """Initializes the distributed process group."""
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355' # A free port
+    # NCCL is the standard backend for GPU-based distributed training
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
 
 def cleanup_ddp():
     """Cleans up the distributed process group."""
@@ -98,7 +101,7 @@ def collate_fn(batch):
     images, boxes = zip(*batch)
     return torch.stack(images, 0), boxes
 
-# --- Dataset Classes (Unchanged) ---
+# --- Dataset Classes (with improved logging) ---
 class VisDroneDatasetLazy(Dataset):
     def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
@@ -145,68 +148,85 @@ class VisDroneDatasetLazy(Dataset):
 class VisDroneDatasetPreload(Dataset):
     def __init__(self, root_dir, transform=None):
         cache_path = os.path.join(root_dir, CACHE_FILE)
+        rank = dist.get_rank()
+
         if is_main_process():
             if os.path.exists(cache_path):
-                console.print(f"⏳ [blue]Loading pre-processed dataset from cache: {cache_path}[/blue]")
+                console.print(f"✅ [Rank {rank}] Main process found existing cache. Loading from: {cache_path}")
                 try:
-                    cached_data = torch.load(cache_path, weights_only=False)
+                    cached_data = torch.load(cache_path, map_location='cpu') # Load to CPU first
                     self.images = cached_data['images']
                     self.annotations = cached_data['annotations']
-                    console.print(f"✅ [green]Cached dataset loaded successfully. {len(self.images)} items in memory.[/green]")
-                    return
+                    console.print(f"✅ [Rank {rank}] Cached dataset loaded successfully. {len(self.images)} items in memory.")
                 except Exception as e:
-                    console.print(f"⚠️ [yellow]Could not load cache file: {e}. Re-processing dataset.[/yellow]")
-            console.print(f"⏳ [magenta]No cache found. Pre-processing dataset into tensors... This may take a moment.[/magenta]")
-            self.images = []
-            self.annotations = []
-            image_dir = os.path.join(root_dir, 'images')
-            annotation_dir = os.path.join(root_dir, 'annotations_v11')
-            image_files = sorted(os.listdir(image_dir))
-            with Progress(console=console) as progress:
-                task = progress.add_task("[cyan]Processing Data...", total=len(image_files))
-                for img_name in image_files:
-                    progress.update(task, advance=1)
-                    img_path = os.path.join(image_dir, img_name)
-                    try:
-                        with Image.open(img_path) as img:
-                            img_rgb = img.convert("RGB")
-                            original_size = img_rgb.size
-                            self.images.append(transform(img_rgb) if transform else TF.to_tensor(img_rgb))
-                    except Exception as e:
-                        console.print(f"Warning: Could not load image {img_path}. Skipping. Error: {e}", style="yellow")
-                        continue
-                    boxes = []
-                    annotation_name = f"{os.path.splitext(img_name)[0]}.txt"
-                    annotation_path = os.path.join(annotation_dir, annotation_name)
-                    if os.path.exists(annotation_path):
-                        with open(annotation_path, 'r') as f:
-                            for line in f.readlines():
-                                try:
-                                    parts = line.strip().split(',')
-                                    if len(parts) >= 4:
-                                        x1, y1, w, h = map(float, parts[:4])
-                                        boxes.append([x1, y1, x1 + w, y1 + h])
-                                except (ValueError, IndexError):
-                                    continue
-                    boxes_tensor = torch.tensor(boxes, dtype=torch.float32)
-                    if boxes_tensor.nelement() > 0:
-                        scale_x, scale_y = 640 / original_size[0], 640 / original_size[1]
-                        boxes_tensor[:, [0, 2]] *= scale_x
-                        boxes_tensor[:, [1, 3]] *= scale_y
-                    self.annotations.append(boxes_tensor)
-            console.print(f"💾 [blue]Saving pre-processed dataset to cache for future runs...[/blue]")
-            try:
-                torch.save({'images': self.images, 'annotations': self.annotations}, cache_path)
-                console.print(f"✅ [green]Dataset cached successfully at: {cache_path}[/green]")
-            except Exception as e:
-                console.print(f"⚠️ [red]Could not save cache file: {e}[/red]")
-        # Wait for main process to create cache
+                    console.print(f"⚠️ [Rank {rank}] Could not load cache file: {e}. Re-processing dataset.")
+                    self._create_cache(root_dir, transform, cache_path)
+            else:
+                self._create_cache(root_dir, transform, cache_path)
+        
+        # --- DEBUG LOGGING ---
+        # All processes will wait here until the main process is done creating the cache.
+        print(f"[INFO - Rank {rank}] Reached barrier, waiting for all processes...")
         dist.barrier()
+        print(f"[INFO - Rank {rank}] Passed barrier.")
+
         # All processes load from the now-guaranteed-to-exist cache
         if not is_main_process():
-            cached_data = torch.load(cache_path, weights_only=False)
+            print(f"[INFO - Rank {rank}] Loading dataset from cache: {cache_path}")
+            cached_data = torch.load(cache_path, map_location='cpu')
             self.images = cached_data['images']
             self.annotations = cached_data['annotations']
+            print(f"[INFO - Rank {rank}] Successfully loaded {len(self.images)} items from cache.")
+
+    def _create_cache(self, root_dir, transform, cache_path):
+        """Logic for creating the cache, only run by the main process."""
+        console.print(f"⏳ [magenta][Rank 0] No cache found. Starting pre-processing of dataset.[/magenta]")
+        console.print(f"   [yellow]This is a one-time operation and may take a significant amount of time.[/yellow]")
+        self.images = []
+        self.annotations = []
+        image_dir = os.path.join(root_dir, 'images')
+        annotation_dir = os.path.join(root_dir, 'annotations_v11')
+        image_files = sorted(os.listdir(image_dir))
+        
+        with Progress(console=console, disable=not is_main_process()) as progress:
+            task = progress.add_task("[cyan]Processing Data...", total=len(image_files))
+            for img_name in image_files:
+                progress.update(task, advance=1)
+                img_path = os.path.join(image_dir, img_name)
+                try:
+                    with Image.open(img_path) as img:
+                        img_rgb = img.convert("RGB")
+                        original_size = img_rgb.size
+                        self.images.append(transform(img_rgb) if transform else TF.to_tensor(img_rgb))
+                except Exception as e:
+                    console.print(f"Warning: Could not load image {img_path}. Skipping. Error: {e}", style="yellow")
+                    continue
+                boxes = []
+                annotation_name = f"{os.path.splitext(img_name)[0]}.txt"
+                annotation_path = os.path.join(annotation_dir, annotation_name)
+                if os.path.exists(annotation_path):
+                    with open(annotation_path, 'r') as f:
+                        for line in f.readlines():
+                            try:
+                                parts = line.strip().split(',')
+                                if len(parts) >= 4:
+                                    x1, y1, w, h = map(float, parts[:4])
+                                    boxes.append([x1, y1, x1 + w, y1 + h])
+                            except (ValueError, IndexError):
+                                continue
+                boxes_tensor = torch.tensor(boxes, dtype=torch.float32)
+                if boxes_tensor.nelement() > 0:
+                    scale_x, scale_y = 640 / original_size[0], 640 / original_size[1]
+                    boxes_tensor[:, [0, 2]] *= scale_x
+                    boxes_tensor[:, [1, 3]] *= scale_y
+                self.annotations.append(boxes_tensor)
+        
+        console.print(f"💾 [blue][Rank 0] Caching complete. Saving to {cache_path}...[/blue]")
+        try:
+            torch.save({'images': self.images, 'annotations': self.annotations}, cache_path)
+            console.print(f"✅ [green][Rank 0] Dataset cached successfully.[/green]")
+        except Exception as e:
+            console.print(f"⚠️ [red][Rank 0] Could not save cache file: {e}[/red]")
 
     def __len__(self):
         return len(self.images)
@@ -259,17 +279,14 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
     """Main training function, now aware of its rank and the world size."""
     if is_main_process(): cudnn.benchmark = True
     
-    # Each process gets its own writer, but only the main one writes.
     writer = SummaryWriter(log_dir=log_dir) if is_main_process() else None
     
-    device = rank # The device is the rank of the process
+    device = rank 
     model = YOLO(MODEL_NAME).to(device)
     model.model.train()
 
-    # Wrap the model with DDP
-    model.model = DDP(model.model, device_ids=[device])
+    model.model = DDP(model.model, device_ids=[device], find_unused_parameters=False)
     
-    # torch.compile after DDP wrapping
     try:
         model.model = torch.compile(model.model)
         if is_main_process(): console.print("✅ [green]Model compiled successfully with torch.compile().[/green]")
@@ -294,9 +311,8 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
 
     if args.resume and os.path.exists(args.resume):
         if is_main_process(): console.print(f"🔄 [blue]Resuming training from checkpoint: {args.resume}[/blue]")
-        # Load checkpoint to the correct device
         checkpoint = torch.load(args.resume, map_location=f'cuda:{rank}')
-        # DDP stores the model in a 'module' attribute
+        # When loading a checkpoint, you must load into the .module attribute of the DDP-wrapped model
         model.model.module.load_state_dict(checkpoint['model_state_dict'])
         adversarial_patch.data = checkpoint['patch_state_dict'].to(device)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -316,7 +332,6 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
     
     use_preload = available_ram_gb > RAM_THRESHOLD_GB
     if use_preload:
-        if is_main_process(): console.print(f"🚀 [magenta]High RAM detected. Using high-performance RAM pre-loading strategy.[/magenta]")
         dataset = VisDroneDatasetPreload(root_dir=DATASET_PATH, transform=transform)
     else:
         if is_main_process(): console.print(f"💾 [magenta]Using memory-safe on-demand disk loading strategy.[/magenta]")
@@ -353,7 +368,7 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
     best_loss_epoch = -1
 
     for epoch in range(start_epoch, args.max_epochs):
-        sampler.set_epoch(epoch) # Important for shuffling
+        sampler.set_epoch(epoch) # Crucial for proper shuffling in DDP
         epoch_start_time = time.time()
         total_adv_loss, total_tv_loss = 0, 0
         
@@ -398,7 +413,7 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
             scaler.update()
             adversarial_patch.data.clamp_(0, 1)
             
-            # Aggregate losses from all GPUs
+            # Aggregate losses from all GPUs for accurate logging
             dist.all_reduce(total_loss, op=dist.ReduceOp.AVG)
             dist.all_reduce(adv_loss, op=dist.ReduceOp.AVG)
             dist.all_reduce(tv_loss, op=dist.ReduceOp.AVG)
@@ -421,10 +436,11 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
                 best_loss = avg_total_loss
                 epochs_no_improve = 0
                 best_loss_epoch = epoch + 1
-                # Save the raw model, not the DDP wrapper
+                # Save the raw model by accessing .module
+                unwrapped_model = model.module.module if hasattr(model.module, 'module') else model.module
                 save_dict = {
                     'epoch': epoch + 1, 
-                    'model_state_dict': model.module.module.state_dict(), # Unwrapping torch.compile and DDP
+                    'model_state_dict': unwrapped_model.state_dict(),
                     'patch_state_dict': adversarial_patch.data.clone(), 
                     'optimizer_state_dict': optimizer.state_dict(), 
                     'scaler_state_dict': scaler.state_dict(), 
@@ -449,10 +465,21 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
             writer.add_scalar('Loss/Adversarial', avg_adv_loss, epoch); writer.add_scalar('Loss/TotalVariation', avg_tv_loss, epoch); writer.add_scalar('Loss/Total', avg_total_loss, epoch); writer.add_scalar('Learning_Rate', current_lr, epoch); writer.add_image('Adversarial Patch', adversarial_patch, epoch)
             
             if epochs_no_improve >= args.early_stopping_patience:
-                live.stop()
+                if live: live.stop()
                 console.print(f"\n🛑 [bold red]Early stopping triggered after {args.early_stopping_patience} epochs with no improvement.[/bold red]")
+                # Signal other processes to exit
+                stop_signal = torch.tensor([1]).to(device)
+            else:
+                stop_signal = torch.tensor([0]).to(device)
+            dist.broadcast(stop_signal, src=0)
+            if stop_signal.item() == 1:
                 break
-    
+        else: # Non-main processes check for stop signal
+            stop_signal = torch.tensor([0]).to(device)
+            dist.broadcast(stop_signal, src=0)
+            if stop_signal.item() == 1:
+                break
+
     if is_main_process() and live: live.stop()
     if is_main_process() and writer: writer.close()
 
@@ -474,6 +501,7 @@ def main():
     world_size = int(os.environ["WORLD_SIZE"])
     
     setup_ddp(rank, world_size)
+    print(f"[INFO - Rank {rank}/{world_size}] DDP setup complete. CUDA Device: {torch.cuda.current_device()}")
 
     try:
         if is_main_process():
@@ -491,28 +519,33 @@ def main():
         
         temp_dataset_len = len(os.listdir(os.path.join(DATASET_PATH, 'images')))
         
+        # --- Batch Size Determination ---
+        final_batch_size = 0
         if args.batch_size:
             final_batch_size = args.batch_size
             if is_main_process(): console.print(f"✅ [green]Using user-provided per-GPU batch size: {final_batch_size}[/green]")
         elif args.resume:
-            checkpoint = torch.load(args.resume, map_location='cpu')
-            final_batch_size = checkpoint.get('batch_size', BASE_BATCH_SIZE)
-            if is_main_process(): console.print(f"Resuming with batch size {final_batch_size} from checkpoint.")
+            # Only main process needs to read the file
+            if is_main_process():
+                checkpoint = torch.load(args.resume, map_location='cpu')
+                final_batch_size = checkpoint.get('batch_size', BASE_BATCH_SIZE)
+                console.print(f"Resuming with batch size {final_batch_size} from checkpoint.")
         else:
             if is_main_process():
-                console.print(f"🛠️ [magenta]Preparing for autotune...[/magenta]")
+                console.print(f"🛠️ [magenta]Starting batch size autotune on Rank 0...[/magenta]")
                 temp_model = YOLO(MODEL_NAME).to(rank)
                 temp_model.model.train()
                 final_batch_size = autotune_batch_size(device=rank, model=temp_model.model, dataset_len=temp_dataset_len)
                 del temp_model
                 torch.cuda.empty_cache()
-            else:
-                final_batch_size = 0 # Placeholder, will be broadcasted
         
         # Broadcast the determined batch size from the main process to all others
+        print(f"[INFO - Rank {rank}] Waiting to receive batch size...")
         batch_size_tensor = torch.tensor([final_batch_size], dtype=torch.int64).to(rank)
         dist.broadcast(batch_size_tensor, src=0)
         final_batch_size = batch_size_tensor.item()
+        print(f"[INFO - Rank {rank}] Received batch size: {final_batch_size}")
+
 
         effective_batch_size = final_batch_size * world_size
         scaled_lr = BASE_LEARNING_RATE * math.sqrt(effective_batch_size / BASE_BATCH_SIZE)
@@ -529,6 +562,9 @@ def main():
         dist.broadcast_object_list(log_dir_list, src=0)
         log_dir = log_dir_list[0]
 
+        if is_main_process():
+            console.print("✅ [green]Setup complete. Starting training loop...[/green]")
+
         train_adversarial_patch(rank, world_size, args, final_batch_size, scaled_lr, log_dir)
 
     except Exception as e:
@@ -538,13 +574,14 @@ def main():
             console.print("="*60)
             error_info = "".join(traceback.format_exception(type(e), e, e.__traceback__))
             console.print(error_info)
-            # send_crash_notification(error_info) # Optional crash reporting
-        raise e
+        # Ensure all processes see the error and exit
+        print(f"[ERROR - Rank {rank}] Encountered an exception: {e}")
+        traceback.print_exc()
     finally:
+        print(f"[INFO - Rank {rank}] Cleaning up DDP.")
         cleanup_ddp()
 
 if __name__ == '__main__':
-    # Set start method to 'spawn' for compatibility
-    # This is generally not needed when using torchrun, but can be a good practice
+    # Using 'spawn' is generally a good practice for CUDA multiprocessing applications
     mp.set_start_method('spawn', force=True) 
     main()

@@ -315,7 +315,7 @@ if __name__ == '__main__':
     parser.add_argument('--patch_path', type=str, default=DEFAULT_PATCH_PATH, help='Path to the adversarial patch image file.')
     parser.add_argument('--dataset_path', type=str, default=DEFAULT_DATASET_PATH, help='Path to the root of the evaluation dataset.')
     parser.add_argument('--model_name', type=str, default=DEFAULT_MODEL_NAME, help='YOLO model name or path to weights.')
-    parser.add_-argument('--conf_thresh', type=float, default=CONF_THRESHOLD, help='Confidence threshold for object detection.')
+    parser.add_argument('--conf_thresh', type=float, default=CONF_THRESHOLD, help='Confidence threshold for object detection.')
     parser.add_argument('--iou_thresh', type=float, default=IOU_THRESHOLD, help='IoU threshold for matching objects.')
     parser.add_argument('--gpu_id', type=int, default=0, help='ID of the GPU to use. Set to None to use CPU.')
     parser.add_argument('--save_examples', type=int, default=10, help='Number of visual examples to save. Set to 0 to disable.')

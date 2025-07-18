@@ -32,14 +32,15 @@ from rich.panel import Panel
 # --- Configuration (Defaults) ---
 DATASET_PATH = 'VisDrone2019-DET-train'
 MODEL_NAME = 'yolov11n.pt' 
-PATCH_SIZE = 500
-BASE_LEARNING_RATE = 0.01
+# MODIFICATION: Reduced patch size to encourage more generalizable features.
+PATCH_SIZE = 300
+BASE_LEARNING_RATE = 0.001 
 BASE_BATCH_SIZE = 8
-DEFAULT_MAX_EPOCHS = 1000
+DEFAULT_MAX_EPOCHS = 2000
 
 # --- Smart Training Config ---
-PLATEAU_PATIENCE = 10
-EARLY_STOPPING_PATIENCE = 25 
+PLATEAU_PATIENCE = 20
+EARLY_STOPPING_PATIENCE = 50 
 CHECKPOINT_FILE = "patch_checkpoint.pth"
 BEST_CHECKPOINT_FILE = "best_patch_checkpoint.pth"
 CACHE_FILE = "preprocessed_dataset.pth"
@@ -260,7 +261,7 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
         Layout(Panel(f"🚀 [bold magenta]Starting Adversarial Patch Training[/bold magenta]\n"
                      f"   - [b]Device[/b]: [cyan]{device.type.upper()}[/cyan]\n"
                      f"   - [b]Batch Size[/b]: [cyan]{batch_size}[/cyan]\n"
-                     f"   - [b]Scaled LR[/b]: [cyan]{learning_rate:.2e}[/cyan]\n"
+                     f"   - [b]Learning Rate[/b]: [cyan]{learning_rate:.2e}[/cyan]\n"
                      f"   - [b]DataLoaders[/b]: [cyan]{num_workers}[/cyan]\n"
                      f"   - [b]TV Weight[/b]: [cyan]{tv_weight}[/cyan]\n"
                      f"   - [b]Patience[/b]: [cyan]{early_stopping_patience}[/cyan]",
@@ -373,7 +374,6 @@ def train_adversarial_patch(batch_size, learning_rate, log_dir, max_epochs, devi
             results_table.add_column("LR", style="cyan")
             results_table.add_column("Patience", style="blue")
             
-            # FIX: Only display the last N epochs to prevent overflow
             display_epochs = epoch_results[-40:]
 
             for result in display_epochs:
@@ -466,9 +466,8 @@ if __name__ == '__main__':
         console.print("Autotune is only for CUDA. Using base batch size.")
         final_batch_size = BASE_BATCH_SIZE
 
-    num_gpus = len(args.gpu_ids) if args.gpu_ids else 1
-    effective_batch_size = final_batch_size * num_gpus
-    scaled_lr = BASE_LEARNING_RATE * (effective_batch_size / BASE_BATCH_SIZE)
+    # MODIFICATION: Removed learning rate scaling. LR is now fixed.
+    learning_rate = BASE_LEARNING_RATE
     
     session_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_dir = os.path.join(parent_log_dir, session_timestamp)
@@ -497,7 +496,7 @@ if __name__ == '__main__':
 
         train_adversarial_patch(
             batch_size=final_batch_size, 
-            learning_rate=scaled_lr,
+            learning_rate=learning_rate,
             log_dir=log_dir,
             max_epochs=args.max_epochs,
             device=device,
