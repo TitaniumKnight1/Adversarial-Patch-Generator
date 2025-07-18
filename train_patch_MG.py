@@ -248,7 +248,8 @@ def autotune_batch_size(device, model, dataset_len, initial_batch_size=2):
             images = next(iter(dataloader)).to(device)
             images.requires_grad_(True)
             with torch.amp.autocast(device_type='cuda'):
-                output = model.model(images)
+                # The model object passed in is already the nn.Module, so call it directly.
+                output = model(images)
                 dummy_loss = output[0].sum()
             dummy_loss.backward()
             console.print(f"✅ [green]Batch size {batch_size} fits in memory. Trying next size...[/green]")
