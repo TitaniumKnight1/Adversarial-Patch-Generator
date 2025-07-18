@@ -339,7 +339,7 @@ def train_adversarial_patch(rank, world_size, args, batch_size, learning_rate, l
                          f"   - [b]World Size[/b]: [cyan]{world_size} GPUs[/cyan]\n"
                          f"   - [b]Batch Size (per GPU)[/b]: [cyan]{batch_size}[/cyan]\n"
                          f"   - [b]Effective Batch Size[/b]: [cyan]{batch_size * world_size}[/cyan]\n"
-                         f"   - [b]Scaled LR[/b]: [cyan]{learning_rate:.2e}[/cyan]\n"
+                         f"   - [b]Learning Rate[/b]: [cyan]{learning_rate:.2e}[/cyan]\n"
                          f"   - [b]DataLoaders (per GPU)[/b]: [cyan]{0 if use_preload else min(os.cpu_count() // world_size, 16)}[/cyan]",
                          title="[yellow]Training Configuration[/yellow]", border_style="yellow"),
                    name="config", size=9),
@@ -566,6 +566,17 @@ def main():
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
+    # --- Add a warning if not using torchrun correctly ---
+    if rank == 0 and world_size == 1 and torch.cuda.device_count() > 1:
+        console.print(Panel(
+            "[bold yellow]WARNING: Multiple GPUs detected, but the script is running on a single process.[/bold yellow]\n\n"
+            "To use all available GPUs for distributed training, you MUST launch this script using `torchrun`.\n\n"
+            f"Example for {torch.cuda.device_count()} GPUs:\n"
+            f"[cyan]torchrun --nproc_per_node={torch.cuda.device_count()} your_script_name.py[/cyan]",
+            title="[bold red]Performance Warning[/bold red]",
+            border_style="red"
+        ))
+
     # --- Setup Logging and Exception Hook ---
     log_dir = None
     if rank == 0:
@@ -657,10 +668,10 @@ def main():
             dist.broadcast(batch_size_tensor, src=0)
             final_batch_size = batch_size_tensor.item()
 
-        effective_batch_size = final_batch_size * world_size
-        scaled_lr = BASE_LEARNING_RATE * math.sqrt(effective_batch_size / BASE_BATCH_SIZE)
+        # --- Use fixed base learning rate as requested ---
+        learning_rate = BASE_LEARNING_RATE
         
-        train_adversarial_patch(rank, world_size, args, final_batch_size, scaled_lr, log_dir)
+        train_adversarial_patch(rank, world_size, args, final_batch_size, learning_rate, log_dir)
 
     except Exception as e:
         logging.critical("A critical error occurred in the main execution block.", exc_info=True)
