@@ -40,7 +40,7 @@ import requests
 import traceback
 import sys
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from datetime import datetime
+import datetime
 import math
 import signal
 import psutil
@@ -580,7 +580,7 @@ def main():
     # --- Setup Logging and Exception Hook ---
     log_dir = None
     if rank == 0:
-        session_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        session_timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         log_dir_base = "runs"
         log_dir = os.path.join(log_dir_base, session_timestamp)
         if args.resume:
