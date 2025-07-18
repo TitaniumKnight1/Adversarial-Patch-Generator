@@ -146,57 +146,49 @@ class VisDroneDatasetLazy(Dataset):
 class VisDroneDatasetPreload(Dataset):
     def __init__(self, root_dir, transform=None):
         cache_path = os.path.join(root_dir, CACHE_FILE)
-        rank = dist.get_rank()
-
+        
         if is_main_process():
             if os.path.exists(cache_path):
-                console.print(f"✅ [Rank {rank}] Main process found existing cache. Loading from: {cache_path}")
+                console.print(f"✅ Main process found existing cache. Loading from: {cache_path}")
                 try:
                     cached_data = torch.load(cache_path, map_location='cpu')
                     self.images = cached_data['images']
                     self.annotations = cached_data['annotations']
-                    console.print(f"✅ [Rank {rank}] Cached dataset loaded successfully. {len(self.images)} items in memory.")
+                    console.print(f"✅ Cached dataset loaded successfully. {len(self.images)} items in memory.")
                 except Exception as e:
-                    console.print(f"⚠️ [Rank {rank}] Could not load cache file: {e}. Re-processing dataset.")
+                    console.print(f"⚠️ Could not load cache file: {e}. Re-processing dataset.")
                     self._create_cache(root_dir, transform, cache_path)
             else:
                 self._create_cache(root_dir, transform, cache_path)
         
-        # All processes will wait here until the main process is done creating the cache.
-        print(f"[INFO - Rank {rank}] Reached barrier, waiting for cache creation...", flush=True)
+        # All processes must wait here for the main process to finish creating the cache.
+        # This is a blocking call.
         dist.barrier()
-        print(f"[INFO - Rank {rank}] Passed barrier. Cache is ready.", flush=True)
 
-        # All processes load from the now-guaranteed-to-exist cache
+        # After the barrier, all non-main processes load the now-guaranteed-to-exist cache.
         if not is_main_process():
-            print(f"[INFO - Rank {rank}] Loading dataset from cache: {cache_path}", flush=True)
             cached_data = torch.load(cache_path, map_location='cpu')
             self.images = cached_data['images']
             self.annotations = cached_data['annotations']
-            print(f"[INFO - Rank {rank}] Successfully loaded {len(self.images)} items from cache.", flush=True)
 
     def _create_cache(self, root_dir, transform, cache_path):
         """Logic for creating the cache, only run by the main process."""
-        console.print(f"⏳ [magenta][Rank 0] No cache found. Starting pre-processing of dataset.[/magenta]")
+        console.print(f"⏳ [magenta]No cache found. Starting pre-processing of dataset.[/magenta]")
         self.images = []
         self.annotations = []
         image_dir = os.path.join(root_dir, 'images')
         annotation_dir = os.path.join(root_dir, 'annotations_v11')
         image_files = sorted(os.listdir(image_dir))
         
-        # Define a feature-rich progress bar for the caching process
         caching_progress = Progress(
             TextColumn("[cyan]Caching Dataset..."),
             BarColumn(),
-            "[progress.percentage]{task.percentage:>3.1f}%",
-            "•",
-            MofNCompleteColumn(),
-            "•",
+            "[progress.percentage]{task.percentage:>3.1f}%", "•",
+            MofNCompleteColumn(), "•",
             TimeRemainingColumn(),
             console=console
         )
         
-        # Use a Live display to manage the progress bar rendering robustly
         with Live(caching_progress, console=console, refresh_per_second=10, vertical_overflow="visible") as live:
             task = caching_progress.add_task("Processing images", total=len(image_files))
             for img_name in image_files:
@@ -208,7 +200,6 @@ class VisDroneDatasetPreload(Dataset):
                         original_size = img_rgb.size
                         self.images.append(transform(img_rgb) if transform else TF.to_tensor(img_rgb))
                 except Exception as e:
-                    # Use live.console to print without breaking the progress bar
                     live.console.print(f"Warning: Could not load image {img_path}. Skipping. Error: {e}", style="yellow")
                     continue
                 boxes = []
@@ -231,12 +222,12 @@ class VisDroneDatasetPreload(Dataset):
                     boxes_tensor[:, [1, 3]] *= scale_y
                 self.annotations.append(boxes_tensor)
         
-        console.print(f"💾 [blue][Rank 0] Caching complete. Saving to {cache_path}...[/blue]")
+        console.print(f"💾 [blue]Caching complete. Saving to {cache_path}...[/blue]")
         try:
             torch.save({'images': self.images, 'annotations': self.annotations}, cache_path)
-            console.print(f"✅ [green][Rank 0] Dataset cached successfully.[/green]")
+            console.print(f"✅ [green]Dataset cached successfully.[/green]")
         except Exception as e:
-            console.print(f"⚠️ [red][Rank 0] Could not save cache file: {e}[/red]")
+            console.print(f"⚠️ [red]Could not save cache file: {e}[/red]")
 
     def __len__(self):
         return len(self.images)
@@ -515,7 +506,10 @@ def main():
     world_size = int(os.environ["WORLD_SIZE"])
     
     setup_ddp(rank, world_size)
-    print(f"[INFO - Rank {rank}/{world_size}] DDP setup complete. CUDA Device: {torch.cuda.current_device()}", flush=True)
+    
+    # Only the main process should print verbose status messages
+    if is_main_process():
+        print(f"[INFO] DDP setup complete for {world_size} processes. Main process (Rank 0) is running on CUDA device: {torch.cuda.current_device()}", flush=True)
 
     try:
         if is_main_process():
@@ -551,11 +545,12 @@ def main():
                 del temp_model
                 torch.cuda.empty_cache()
         
-        print(f"[INFO - Rank {rank}] Waiting to receive batch size...", flush=True)
         batch_size_tensor = torch.tensor([final_batch_size], dtype=torch.int64).to(rank)
         dist.broadcast(batch_size_tensor, src=0)
         final_batch_size = batch_size_tensor.item()
-        print(f"[INFO - Rank {rank}] Received batch size: {final_batch_size}", flush=True)
+        if is_main_process():
+             print(f"[INFO] Determined and broadcasted batch size: {final_batch_size}", flush=True)
+
 
         effective_batch_size = final_batch_size * world_size
         scaled_lr = BASE_LEARNING_RATE * math.sqrt(effective_batch_size / BASE_BATCH_SIZE)
@@ -583,10 +578,12 @@ def main():
             console.print("="*60)
             error_info = "".join(traceback.format_exception(type(e), e, e.__traceback__))
             console.print(error_info)
+        # Ensure all processes see the error and exit
         print(f"[ERROR - Rank {rank}] Encountered an exception: {e}", flush=True)
         traceback.print_exc()
     finally:
-        print(f"[INFO - Rank {rank}] Cleaning up DDP.", flush=True)
+        if is_main_process():
+            print(f"[INFO] Main process (Rank 0) cleaning up DDP.", flush=True)
         cleanup_ddp()
 
 if __name__ == '__main__':
