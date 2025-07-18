@@ -486,9 +486,9 @@ def setup_logging(log_dir, rank):
     
     # Root logger
     logger = logging.getLogger()
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.DEBUG) # Set the lowest level to capture everything
 
-    # File handler - only for the main process to avoid file write conflicts
+    # File handler - captures EVERYTHING (DEBUG and up) to the log file
     if rank == 0:
         os.makedirs(log_dir, exist_ok=True)
         file_handler = logging.FileHandler(os.path.join(log_dir, "training.log"))
@@ -497,16 +497,18 @@ def setup_logging(log_dir, rank):
         file_handler.setFormatter(file_formatter)
         logger.addHandler(file_handler)
 
-    # Rich handler for console output - only for the main process
+    # Rich handler for console output - only shows WARNINGS and above
     if rank == 0:
+        # This handler controls what the user sees in the console.
+        # Setting the level to WARNING hides INFO and DEBUG messages.
         rich_handler = RichHandler(console=console, rich_tracebacks=True, show_path=False)
-        rich_handler.setLevel(logging.INFO)
+        rich_handler.setLevel(logging.WARNING) 
         logger.addHandler(rich_handler)
     else:
-        # Other processes can log to a null handler to avoid output clutter
+        # Other processes should not produce any log output.
         logger.addHandler(logging.NullHandler())
 
-    # Custom adapter to add rank to log records
+    # Custom adapter to add rank to log records for file logging
     class RankAdapter(logging.LoggerAdapter):
         def process(self, msg, kwargs):
             return '[Rank %s] %s' % (self.extra['rank'], msg), kwargs
@@ -519,7 +521,8 @@ def handle_exception(exc_type, exc_value, exc_traceback):
     if issubclass(exc_type, KeyboardInterrupt):
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
         return
-    logging.error("Unhandled exception", exc_info=(exc_type, exc_value, exc_traceback))
+    # This will log the exception to the file configured in setup_logging
+    logging.critical("Unhandled exception", exc_info=(exc_type, exc_value, exc_traceback))
 
 def main():
     parser = argparse.ArgumentParser(description="Distributed training of adversarial patches using DDP.")
@@ -567,9 +570,16 @@ def main():
 
     # --- Pre-flight check for dataset cache (run by main process ONLY) ---
     if rank == 0:
-        logging.info("Script Initializing...")
-        logging.info("First-time run: The script will cache the entire dataset. This can take 10-30+ minutes. A progress bar will be displayed.")
-        logging.info("Subsequent runs: Startup will be much faster.")
+        # Use console.print for UI elements, and logging for status messages
+        console.print(Panel(
+            "[bold yellow]Script Initializing...[/bold yellow]\n\n"
+            "Welcome! The script is starting up. Please be patient.\n\n"
+            "• [bold]First-time run:[/bold] The script will cache the entire dataset. This is a one-time operation that can take [cyan]10-30+ minutes[/cyan] depending on your storage speed. A progress bar will be displayed below.\n"
+            "• [bold]Subsequent runs:[/bold] Startup will be much faster as the script will load the cached dataset.",
+            title="[bold magenta]Startup Information[/bold magenta]",
+            border_style="magenta",
+            expand=False
+        ))
         
         available_ram_gb = psutil.virtual_memory().available / (1024 ** 3)
         if available_ram_gb > RAM_THRESHOLD_GB:
