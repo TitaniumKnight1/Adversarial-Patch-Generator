@@ -193,11 +193,11 @@ class VisDroneDatasetPreload(Dataset):
             MofNCompleteColumn(),
             "•",
             TimeRemainingColumn(),
-            console=console,
-            disable=not is_main_process()
+            console=console
         )
         
-        with caching_progress:
+        # Use a Live display to manage the progress bar rendering robustly
+        with Live(caching_progress, console=console, refresh_per_second=10, vertical_overflow="visible") as live:
             task = caching_progress.add_task("Processing images", total=len(image_files))
             for img_name in image_files:
                 caching_progress.update(task, advance=1)
@@ -208,7 +208,8 @@ class VisDroneDatasetPreload(Dataset):
                         original_size = img_rgb.size
                         self.images.append(transform(img_rgb) if transform else TF.to_tensor(img_rgb))
                 except Exception as e:
-                    console.print(f"Warning: Could not load image {img_path}. Skipping. Error: {e}", style="yellow")
+                    # Use live.console to print without breaking the progress bar
+                    live.console.print(f"Warning: Could not load image {img_path}. Skipping. Error: {e}", style="yellow")
                     continue
                 boxes = []
                 annotation_name = f"{os.path.splitext(img_name)[0]}.txt"
