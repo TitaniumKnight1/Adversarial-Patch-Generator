@@ -1,0 +1,22 @@
+{
+    "models_to_target": [
+        "yolov11n.pt"
+    ],
+    "dataset_path": "VisDrone2019-DET-train",
+    "target_classes": [],
+    "patch_size": 150,
+    "hyperparameters": {
+        "base_learning_rate": 0.025,
+        "base_batch_size": 8,
+        "max_epochs": 200,
+        "plateau_patience": 20,
+        "early_stopping_patience": 50,
+        "cosine_restart_epochs": 75
+    },
+    "loss_weights": {
+        "adv_weight": 1000.0,
+        "pattern_weight": 300.0,
+        "tv_weight": 1.5,
+        "color_weight": 20.0
+    }
+}

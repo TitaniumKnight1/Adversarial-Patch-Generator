@@ -2,8 +2,9 @@ torch
 torchvision
 ultralytics
 Pillow
-tqdm
-requests
-tensorboard
 numpy
+noise
+psutil
+requests
 rich
+tensorboard
