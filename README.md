@@ -63,10 +63,7 @@ This script is configured to use the **VisDrone2019-DET-train** dataset. You can
 .
 ├── VisDrone2019-DET-train/
 │   ├── images/
-│   │   ├── 0000001.jpg
-│   │   └── ...
-│   └── annotations_v11/
-│       ├── 0000001.txt
+│       ├── 0000001.jpg
 │       └── ...
 └── ...
 ```
