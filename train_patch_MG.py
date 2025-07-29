@@ -16,6 +16,8 @@
 # Example with arguments:
 #   torchrun --nproc_per_node=7 your_script_name.py --max_epochs 500 --tv_weight 1e-5
 #
+# THIS SCRIPT IS NOT FULLY COMPLETED, FURTHER WORK MAY BE NEEDED
+#
 # =================================================================================================
 
 import torch
