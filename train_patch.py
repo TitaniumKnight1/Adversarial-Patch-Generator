@@ -43,7 +43,7 @@ def send_notification(title, message, tags="tada"):
     """Sends a notification to a ntfy.sh topic for remote monitoring."""
     try:
         requests.post(
-            "https://ntfy.sh/PatchTraining",  # Replace with your own ntfy.sh topic if desired
+            "https://ntfy.sh/EXAMPLE_TOPIC",  # Replace with your own ntfy.sh topic if desired
             data=message.encode(encoding='utf-8'),
             headers={
                 "Title": title.encode(encoding='utf-8'),
