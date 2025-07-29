@@ -88,6 +88,8 @@ Modify the `config.json` file to set up your training run.
 -   `hyperparameters`: Set learning rate, batch size, epochs, and scheduler settings.
 -   `loss_weights`: Adjust the weights for different components of the loss function.
 
+> **Note on Loss Weights**: The default `loss_weights` in `config.json` are tuned for the `--covert` mode. For normal mode training, you may need to adjust these values for optimal performance. Specifically, setting `pattern_weight` to `0.0` and potentially increasing `adv_weight` is a good starting point.
+
 ### 2. Train the Patch
 
 Run the `train_patch.py` script to begin training.
