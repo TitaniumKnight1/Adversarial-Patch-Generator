@@ -8,3 +8,4 @@ psutil
 requests
 rich
 tensorboard
+kornia

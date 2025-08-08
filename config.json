@@ -4,19 +4,67 @@
     ],
     "dataset_path": "VisDrone2019-DET-train",
     "target_classes": [],
-    "patch_size": 150,
-    "hyperparameters": {
-        "base_learning_rate": 0.025,
-        "base_batch_size": 8,
-        "max_epochs": 200,
-        "plateau_patience": 20,
-        "early_stopping_patience": 50,
-        "cosine_restart_epochs": 75
-    },
-    "loss_weights": {
-        "adv_weight": 1000.0,
-        "pattern_weight": 300.0,
-        "tv_weight": 1.5,
-        "color_weight": 20.0
+    "patch_size": 100,
+    "training_modes": {
+        "normal": {
+            "hyperparameters": {
+                "base_learning_rate": 0.01,
+                "base_batch_size": 8,
+                "max_epochs": 100,
+                "plateau_patience": 20,
+                "early_stopping_patience": 50,
+                "cosine_restart_epochs": 75
+            },
+            "loss_weights": {
+                "adv_weight": 400.0,
+                "style_weight": 50.0,
+                "nps_weight": 0.05,
+                "pattern_weight": 0.0
+            },
+            "noise_parameters": {
+                "persistence": 0.4,
+                "lacunarity": 1.8,
+                "scale": 50.0,
+                "octaves": 10
+            }
+        },
+        "covert_style": {
+            "hyperparameters": {
+                "base_learning_rate": 0.01,
+                "base_batch_size": 8,
+                "max_epochs": 200,
+                "plateau_patience": 20,
+                "early_stopping_patience": 50,
+                "cosine_restart_epochs": 75
+            },
+            "loss_weights": {
+                "adv_weight": 400.0,
+                "nps_weight": 0.5,
+                "style_weight": 50000.0,
+                "pattern_weight": 0.0
+            }
+        },
+        "covert_procedural": {
+            "hyperparameters": {
+                "base_learning_rate": 0.025,
+                "base_batch_size": 8,
+                "max_epochs": 200,
+                "plateau_patience": 20,
+                "early_stopping_patience": 50,
+                "cosine_restart_epochs": 75
+            },
+            "loss_weights": {
+                "adv_weight": 1000.0,
+                "tv_weight": 1.5,
+                "nps_weight": 20.0,
+                "pattern_weight": 300.0
+            },
+            "noise_parameters": {
+                "scale": 25.0,
+                "octaves": 4,
+                "persistence": 0.6,
+                "lacunarity": 2.0
+            }
+        }
     }
 }
