@@ -27,6 +27,7 @@ The toolkit is built for flexibility and performance, offering multiple training
 ```
 .
 ├── train_patch.py              # Main script for single-node training
+├── optimized_train_patch.py    # Experimental performance-optimized trainer (faster, not fully validated)
 ├── train_patch_MG.py           # High-performance script for multi-GPU (DDP) training
 ├── evaluate_patch.py           # Script to evaluate a trained patch's performance
 ├── automate_tuning.py          # Script for automated hyperparameter tuning
@@ -226,3 +227,73 @@ python evaluate_patch.py --model yolov11n.pt --patch runs/<your-run-directory>/b
 * `--iou`: IoU threshold for NMS.
 
 The script will output a summary table detailing the success rate and save visual comparisons to the output directory.
+
+---
+
+## Additional Training Script (Performance-Optimized Variant)
+
+A second training script has been added alongside the stable baseline:
+
+* `train_patch.py` (Baseline / Verified):
+  * Primary, fully validated implementation.
+  * Use this when you need maximum reliability, reproducibility, and consistency with reported results.
+  * All evaluation expectations and documented behaviors assume this script.
+* `optimized_train_patch.py` (Experimental / Faster):
+  * Incorporates performance-oriented changes (e.g., reduced UI overhead, memory/layout tweaks, optional mixed precision behaviors, caching patterns).
+  * Intended to shorten epoch times on modern GPUs.
+  * Not yet fully regression-tested against the baseline for identical convergence dynamics or final patch quality.
+  * Use only if: (a) you are exploring faster iteration, (b) you can manually verify results, or (c) you are running large-scale experiments where slight training-behavior drift is acceptable.
+
+### Choosing Which Script to Use
+| Goal | Recommendation |
+|------|----------------|
+| Stable research / publication | `train_patch.py` |
+| First-time setup / reproduction | `train_patch.py` |
+| Fast exploratory runs | `optimized_train_patch.py` |
+| Automated tuning sweeps (speed prioritized) | Start with `optimized_train_patch.py`, validate winners with `train_patch.py` |
+
+### How to Switch
+Run exactly the same arguments, just change the entry script:
+```bash
+# Baseline
+python train_patch.py --training_mode normal
+
+# Optimized (experimental)
+python optimized_train_patch.py --training_mode normal
+```
+Both scripts share the same configuration file (`config.json`) and output to the `runs/` directory. You can compare outputs (loss curves, patch images) between the two for validation.
+
+### Updated (Extended) File Listing
+Below is an extended view including the new script (original listing above retained intentionally):
+```
+├── train_patch.py               # Stable, fully verified baseline trainer
+├── optimized_train_patch.py     # Experimental performance-optimized trainer (faster, not fully validated)
+├── train_patch_MG.py            # Multi-GPU DDP trainer
+├── evaluate_patch.py            # Evaluation script
+├── automate_tuning.py           # Hyperparameter / noise parameter sweeps
+├── config.json                  # Central configuration
+├── requirements.txt             # Dependencies
+├── finder_scripts/              # (If present) Utility scripts (e.g., LR finder)
+├── yolov11n.pt                  # Example model weight (user-provided)
+└── runs/                        # Output logs, checkpoints, patches
+```
+
+### Validation Suggestions for the Optimized Script
+To build confidence before adopting it broadly:
+1. Run a short training (e.g., 20–30 epochs) on both scripts with identical seeds.
+2. Compare:
+   * Time per epoch
+   * Loss curves (adv + regularizers)
+   * Intermediate patch visual similarity
+3. Evaluate resulting patches using `evaluate_patch.py`.
+4. If divergence is acceptable (or negligible), proceed with longer runs using the optimized version.
+
+### Reporting Issues
+If you observe a behavioral difference that seems unintended (e.g., systematically higher final loss or poorer hide rate), open an issue and include:
+* Script used (`train_patch.py` vs `optimized_train_patch.py`)
+* Commit hash
+* Config excerpt (or full `config.json`)
+* Hardware (GPU model, CUDA version)
+* Command line arguments
+
+---
