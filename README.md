@@ -297,3 +297,8 @@ If you observe a behavioral difference that seems unintended (e.g., systematical
 * Command line arguments
 
 ---
+
+<p align="center">
+  <strong>Developed by</strong> Ryan Stricklin<br>
+  <em>In partnership with Johns Hopkins Applied Physics Laboratory and their resources</em>
+</p>
